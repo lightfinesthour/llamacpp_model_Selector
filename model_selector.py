@@ -10,30 +10,37 @@ import sys
 import json
 import subprocess
 import curses
+import time
 from pathlib import Path
 
 LLAMA_SERVER = r"C:\tools\llamacpp\llama-server.exe"
-MODEL_DIRS = [r"C:\llm", r"E:\llm"]
+MODEL_DIRS   = [r"C:\llm", r"E:\llm"]
 SETTINGS_FILE = Path(__file__).parent / "model_settings.json"
 
 DEFAULTS = {
-    "ngl": 999,
-    "threads": 12,
-    "context": 32768,
-    "host": "REDACTED_HOST",
-    "port": 8080,
-    "flash_attn": True,
+    "ngl":          999,
+    "threads":      12,
+    "context":      32768,
+    "host":         "REDACTED_HOST",
+    "port":         8080,
+    "flash_attn":   True,
     "cache_type_k": None,
     "cache_type_v": None,
-    "verbosity": None,
+    "verbosity":    None,
+    "np":           None,
+    "batch":        None,
+    "ubatch":       None,
+    "mlock":        False,
 }
 
 CONTEXT_OPTIONS = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 200000]
-THREAD_OPTIONS  = [12, 16, 20, 24, 32]
+THREAD_OPTIONS  = [4, 8, 12, 16, 20, 24, 32]
 CACHE_OPTIONS   = [None, "q8_0", "q6_0", "q5_0", "q4_0", "q3_0"]
+NP_OPTIONS      = [None, 1, 2, 3, 4, 6, 8]
+BATCH_OPTIONS   = [None, 256, 512, 1024, 2048, 4096]
 
 
-# ── Persistence ──────────────────────────────────────────────────────────────
+# ── Persistence ───────────────────────────────────────────────────────────────
 
 def load_saved_settings() -> dict:
     if SETTINGS_FILE.exists():
@@ -49,18 +56,32 @@ def save_settings(all_saved: dict):
 
 
 def cfg_for_model(model: Path, all_saved: dict) -> dict:
-    key = str(model)
-    saved = all_saved.get(key, {})
+    saved = all_saved.get(str(model), {})
     cfg = dict(DEFAULTS)
     cfg.update(saved)
     return cfg
 
 
 def persist_cfg(model: Path, cfg: dict, all_saved: dict):
-    # Only save keys that differ from defaults (keeps file tidy)
     delta = {k: v for k, v in cfg.items() if v != DEFAULTS.get(k)}
-    all_saved[str(model)] = delta
+    if delta:
+        all_saved[str(model)] = delta
+    elif str(model) in all_saved:
+        del all_saved[str(model)]
+    # record launch time separately
+    meta = all_saved.setdefault("__meta__", {})
+    meta[str(model)] = {"last_launch": time.time()}
     save_settings(all_saved)
+
+
+def delete_cfg(model: Path, all_saved: dict):
+    all_saved.pop(str(model), None)
+    all_saved.get("__meta__", {}).pop(str(model), None)
+    save_settings(all_saved)
+
+
+def last_launch_time(model: Path, all_saved: dict):
+    return all_saved.get("__meta__", {}).get(str(model), {}).get("last_launch", 0)
 
 
 # ── Model discovery ───────────────────────────────────────────────────────────
@@ -87,6 +108,18 @@ def find_mmproj(model_path: Path):
     return None
 
 
+def fmt_size(path: Path) -> str:
+    try:
+        b = path.stat().st_size
+        for unit in ("B", "KB", "MB", "GB"):
+            if b < 1024:
+                return f"{b:.0f}{unit}"
+            b /= 1024
+        return f"{b:.1f}TB"
+    except OSError:
+        return "?"
+
+
 # ── Command builder ───────────────────────────────────────────────────────────
 
 def build_command(model: Path, cfg: dict) -> list:
@@ -95,7 +128,7 @@ def build_command(model: Path, cfg: dict) -> list:
     if mmproj:
         cmd += ["--mmproj", str(mmproj), "--image-min-tokens", "1024"]
     cmd += ["-ngl", str(cfg["ngl"])]
-    cmd += ["-c", str(cfg["context"])]
+    cmd += ["-c",   str(cfg["context"])]
     cmd += ["--threads", str(cfg["threads"])]
     if cfg["flash_attn"]:
         cmd += ["--flash-attn", "on"]
@@ -108,6 +141,12 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--verbosity", str(cfg["verbosity"])]
     if cfg.get("np"):
         cmd += ["-np", str(cfg["np"])]
+    if cfg.get("batch"):
+        cmd += ["-b", str(cfg["batch"])]
+    if cfg.get("ubatch"):
+        cmd += ["-ub", str(cfg["ubatch"])]
+    if cfg.get("mlock"):
+        cmd += ["--mlock"]
     return cmd
 
 
@@ -122,46 +161,85 @@ def short_label(model: Path, base_dirs):
     return str(model)
 
 
+def apply_sort(models, sort_mode, all_saved):
+    if sort_mode == "recent":
+        return sorted(models, key=lambda m: last_launch_time(m, all_saved), reverse=True)
+    return models  # "name" — already sorted alphabetically from find_models()
+
+
 # ── Drawing ───────────────────────────────────────────────────────────────────
 
-def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, status=""):
+def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
+              filter_str="", status=""):
     stdscr.clear()
     h, w = stdscr.getmaxyx()
 
-    header = " llama.cpp Model Selector  |  arrows=navigate  enter=launch  s=settings  q=quit"
+    # Header
+    header = (
+        " llama.cpp Model Selector  |  "
+        "arrows=navigate  enter=launch  s=settings  "
+        "/=search  o=sort  d=del-settings  r=rescan  q=quit"
+    )
     stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
     stdscr.addstr(0, 0, header[:w-1].ljust(w-1))
     stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
-    mmproj = find_mmproj(models[sel]) if models else None
-    vision_tag = " [VISION]" if mmproj else ""
-    ctk = cfg.get("cache_type_k") or "default"
-    ctv = cfg.get("cache_type_v") or "default"
-    verb = cfg.get("verbosity")
-    verb_str = f"  verb={verb}" if verb is not None else ""
-    saved_marker = " [saved]" if str(models[sel]) in all_saved else ""
-    settings_str = (
-        f" ctx={cfg['context']}  threads={cfg['threads']}  "
-        f"ngl={cfg['ngl']}  port={cfg['port']}  "
-        f"fa={'on' if cfg['flash_attn'] else 'off'}  "
-        f"ctk={ctk}  ctv={ctv}{verb_str}"
-        f"{vision_tag}{saved_marker}"
-    )
+    # Settings bar
+    if models:
+        mmproj      = find_mmproj(models[sel])
+        vision_tag  = " [V]" if mmproj else ""
+        ctk         = cfg.get("cache_type_k") or "-"
+        ctv         = cfg.get("cache_type_v") or "-"
+        verb        = cfg.get("verbosity")
+        np_         = cfg.get("np")
+        bat         = cfg.get("batch")
+        ubat        = cfg.get("ubatch")
+        saved_mark  = " [saved]" if str(models[sel]) in {k for k in all_saved if k != "__meta__"} else ""
+        parts = [
+            f"ctx={cfg['context']}",
+            f"threads={cfg['threads']}",
+            f"ngl={cfg['ngl']}",
+            f"port={cfg['port']}",
+            f"fa={'on' if cfg['flash_attn'] else 'off'}",
+            f"ctk={ctk}",
+            f"ctv={ctv}",
+        ]
+        if verb is not None:  parts.append(f"verb={verb}")
+        if np_  is not None:  parts.append(f"np={np_}")
+        if bat  is not None:  parts.append(f"b={bat}")
+        if ubat is not None:  parts.append(f"ub={ubat}")
+        if cfg.get("mlock"):  parts.append("mlock")
+        settings_str = " " + "  ".join(parts) + vision_tag + saved_mark
+    else:
+        settings_str = " (no models)"
+
     stdscr.attron(curses.color_pair(3))
     stdscr.addstr(1, 0, settings_str[:w-1].ljust(w-1))
     stdscr.attroff(curses.color_pair(3))
 
-    list_start = 3
-    list_h = h - list_start - 3
-    offset = max(0, sel - list_h + 1) if sel >= list_h else 0
+    # Filter bar
+    sort_label = "recent" if sort_mode == "recent" else "name"
+    filter_bar = f" Filter: {filter_str}_  [sort:{sort_label}]  {len(models)} models"
+    stdscr.attron(curses.color_pair(6))
+    stdscr.addstr(2, 0, filter_bar[:w-1].ljust(w-1))
+    stdscr.attroff(curses.color_pair(6))
 
-    for i, model in enumerate(models[offset:offset+list_h]):
-        idx = i + offset
-        label = short_label(model, base_dirs)
+    # Model list
+    list_start = 3
+    list_h     = h - list_start - 2
+    offset     = max(0, sel - list_h + 1) if sel >= list_h else 0
+
+    for i, model in enumerate(models[offset:offset + list_h]):
+        idx       = i + offset
+        label     = short_label(model, base_dirs)
+        size_str  = fmt_size(model)
         has_vision = find_mmproj(model) is not None
-        has_saved  = str(model) in all_saved
-        tag = ("[V]" if has_vision else "   ") + ("*" if has_saved else " ")
-        line = f" {tag} {label}"
+        has_saved  = str(model) in {k for k in all_saved if k != "__meta__"}
+        launched   = last_launch_time(model, all_saved)
+        recency    = ">" if launched else " "
+        vtag       = "[V]" if has_vision else "   "
+        stag       = "*" if has_saved else " "
+        line       = f" {recency}{vtag}{stag} {size_str:>7}  {label}"
         y = list_start + i
         if idx == sel:
             stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
@@ -170,10 +248,11 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, status=""):
         else:
             stdscr.addstr(y, 0, line[:w-1])
 
-    if models:
+    # Status / command preview
+    if models and sel < len(models):
         preview = " ".join(build_command(models[sel], cfg))
         stdscr.attron(curses.color_pair(4))
-        stdscr.addstr(h-2, 0, (" CMD: " + preview)[:w-1].ljust(w-1))
+        stdscr.addstr(h-1, 0, (" CMD: " + preview)[:w-1].ljust(w-1))
         stdscr.attroff(curses.color_pair(4))
 
     if status:
@@ -188,14 +267,18 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, status=""):
 
 def settings_menu(stdscr, cfg):
     fields = [
-        ("context",      "Context length",    CONTEXT_OPTIONS),
-        ("threads",      "Threads",           THREAD_OPTIONS),
-        ("ngl",          "GPU layers (-ngl)", None),
-        ("port",         "Port",              None),
-        ("flash_attn",   "Flash attention",   [True, False]),
-        ("cache_type_k", "Cache K (-ctk)",    CACHE_OPTIONS),
-        ("cache_type_v", "Cache V (-ctv)",    CACHE_OPTIONS),
-        ("verbosity",    "Verbosity",         [None, 0, 1, 2, 3, 4, 5]),
+        ("context",      "Context length",     CONTEXT_OPTIONS),
+        ("threads",      "Threads",            THREAD_OPTIONS),
+        ("ngl",          "GPU layers (-ngl)",  None),
+        ("port",         "Port",               None),
+        ("flash_attn",   "Flash attention",    [True, False]),
+        ("cache_type_k", "Cache K (-ctk)",     CACHE_OPTIONS),
+        ("cache_type_v", "Cache V (-ctv)",     CACHE_OPTIONS),
+        ("verbosity",    "Verbosity",          [None, 0, 1, 2, 3, 4, 5]),
+        ("np",           "Parallel slots (-np)", NP_OPTIONS),
+        ("batch",        "Batch size (-b)",    BATCH_OPTIONS),
+        ("ubatch",       "Micro-batch (-ub)",  BATCH_OPTIONS),
+        ("mlock",        "mlock (pin in RAM)", [False, True]),
     ]
     sel = 0
 
@@ -203,13 +286,15 @@ def settings_menu(stdscr, cfg):
         stdscr.clear()
         h, w = stdscr.getmaxyx()
         stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(0, 0, " Settings  |  up/down=field  left/right=value  enter/q=back".ljust(w-1))
+        stdscr.addstr(0, 0,
+            " Settings  |  up/down=field  left/right or +/-=value  enter/q=back"
+            .ljust(w-1))
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
         for i, (key, label, options) in enumerate(fields):
-            val = cfg.get(key)
+            val     = cfg.get(key)
             display = str(val) if val is not None else "default"
-            line = f"  {label:<22} {display}"
+            line    = f"  {label:<26} {display}"
             if i == sel:
                 stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
                 stdscr.addstr(2 + i, 0, line[:w-1].ljust(w-1))
@@ -217,11 +302,9 @@ def settings_menu(stdscr, cfg):
             else:
                 stdscr.addstr(2 + i, 0, line[:w-1])
 
-        stdscr.addstr(2 + len(fields) + 1, 2,
-                      "left/right or +/- to change value   q/enter to go back")
         stdscr.refresh()
-
         key = stdscr.getch()
+
         if key in (ord('q'), ord('s'), 27, 10, 13):
             break
         elif key == curses.KEY_UP:
@@ -236,11 +319,19 @@ def settings_menu(stdscr, cfg):
                 idx = options.index(cur) if cur in options else 0
                 cfg[fkey] = options[(idx + direction) % len(options)]
             else:
-                step = 1
                 if fkey == "ngl":
-                    cfg[fkey] = max(0, cfg[fkey] + direction * step)
+                    cfg[fkey] = max(0, cfg[fkey] + direction)
                 elif fkey == "port":
-                    cfg[fkey] = max(1024, cfg[fkey] + direction * step)
+                    cfg[fkey] = max(1024, cfg[fkey] + direction)
+
+
+# ── Search / filter ───────────────────────────────────────────────────────────
+
+def filter_models(all_models, query: str):
+    if not query:
+        return all_models
+    q = query.lower()
+    return [m for m in all_models if q in m.name.lower() or q in str(m).lower()]
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -249,63 +340,123 @@ def main(stdscr):
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_BLACK, curses.COLOR_CYAN)
-    curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-    curses.init_pair(3, curses.COLOR_CYAN,  -1)
-    curses.init_pair(4, curses.COLOR_WHITE, curses.COLOR_BLACK)
-    curses.init_pair(5, curses.COLOR_GREEN, -1)
+    curses.init_pair(1, curses.COLOR_BLACK,  curses.COLOR_CYAN)    # header
+    curses.init_pair(2, curses.COLOR_BLACK,  curses.COLOR_YELLOW)  # selected
+    curses.init_pair(3, curses.COLOR_CYAN,   -1)                   # settings bar
+    curses.init_pair(4, curses.COLOR_WHITE,  curses.COLOR_BLACK)   # cmd preview
+    curses.init_pair(5, curses.COLOR_GREEN,  -1)                   # status
+    curses.init_pair(6, curses.COLOR_YELLOW, -1)                   # filter bar
 
     base_dirs = [Path(d) for d in MODEL_DIRS]
+
     stdscr.addstr(0, 0, "Scanning for models...")
     stdscr.refresh()
 
-    models = find_models()
-    all_saved = load_saved_settings()
+    all_models = find_models()
+    all_saved  = load_saved_settings()
 
-    if not models:
+    if not all_models:
         stdscr.clear()
         stdscr.addstr(0, 0, "No GGUF models found in " + ", ".join(MODEL_DIRS))
         stdscr.addstr(1, 0, "Press any key to exit.")
         stdscr.getch()
         return
 
-    sel = 0
-    cfg = cfg_for_model(models[sel], all_saved)
-    status = f"Found {len(models)} models.  * = saved settings"
+    sort_mode  = "name"
+    filter_str = ""
+    models     = apply_sort(filter_models(all_models, filter_str), sort_mode, all_saved)
+    sel        = 0
+    cfg        = cfg_for_model(models[sel], all_saved)
+    status     = f"Found {len(all_models)} models.   [V]=vision  *=saved  >=launched"
 
     while True:
-        draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, status)
+        draw_list(stdscr, models, sel, cfg, base_dirs, all_saved,
+                  sort_mode, filter_str, status)
         key = stdscr.getch()
+        status = ""
 
+        # ── Quit ──
         if key in (ord('q'), ord('Q'), 27):
             break
 
+        # ── Navigation ──
         elif key == curses.KEY_UP:
-            sel = (sel - 1) % len(models)
+            sel = (sel - 1) % len(models) if models else 0
             cfg = cfg_for_model(models[sel], all_saved)
-            status = ""
 
         elif key == curses.KEY_DOWN:
-            sel = (sel + 1) % len(models)
+            sel = (sel + 1) % len(models) if models else 0
             cfg = cfg_for_model(models[sel], all_saved)
-            status = ""
 
         elif key == curses.KEY_PPAGE:
             sel = max(0, sel - 10)
             cfg = cfg_for_model(models[sel], all_saved)
-            status = ""
 
         elif key == curses.KEY_NPAGE:
             sel = min(len(models) - 1, sel + 10)
             cfg = cfg_for_model(models[sel], all_saved)
-            status = ""
 
+        # ── Settings ──
         elif key in (ord('s'), ord('S')):
             settings_menu(stdscr, cfg)
             persist_cfg(models[sel], cfg, all_saved)
             status = "Settings saved."
 
+        # ── Delete saved settings ──
+        elif key in (ord('d'), ord('D')):
+            if models:
+                delete_cfg(models[sel], all_saved)
+                cfg = cfg_for_model(models[sel], all_saved)
+                status = "Saved settings cleared for this model."
+
+        # ── Sort toggle ──
+        elif key in (ord('o'), ord('O')):
+            sort_mode = "recent" if sort_mode == "name" else "name"
+            cur_model = models[sel] if models else None
+            models = apply_sort(filter_models(all_models, filter_str), sort_mode, all_saved)
+            sel = models.index(cur_model) if cur_model in models else 0
+            status = f"Sorted by {'last launched' if sort_mode == 'recent' else 'name'}."
+
+        # ── Rescan ──
+        elif key in (ord('r'), ord('R')):
+            stdscr.addstr(0, 0, "Rescanning...")
+            stdscr.refresh()
+            cur_model  = models[sel] if models else None
+            all_models = find_models()
+            models     = apply_sort(filter_models(all_models, filter_str), sort_mode, all_saved)
+            sel        = models.index(cur_model) if cur_model in models else 0
+            cfg        = cfg_for_model(models[sel], all_saved) if models else dict(DEFAULTS)
+            status     = f"Rescan complete. {len(all_models)} models found."
+
+        # ── Search / filter ──
+        elif key == ord('/'):
+            # Enter filter mode — read characters until Enter/Esc
+            curses.curs_set(1)
+            filter_str = ""
+            cur_model  = models[sel] if models else None
+            while True:
+                models = apply_sort(filter_models(all_models, filter_str), sort_mode, all_saved)
+                sel    = 0
+                if cur_model in models:
+                    sel = models.index(cur_model)
+                cfg = cfg_for_model(models[sel], all_saved) if models else dict(DEFAULTS)
+                draw_list(stdscr, models, sel, cfg, base_dirs, all_saved,
+                          sort_mode, filter_str, f"Filter mode — type to search, Enter/Esc to confirm")
+                fkey = stdscr.getch()
+                if fkey in (10, 13, 27):
+                    break
+                elif fkey in (curses.KEY_BACKSPACE, 127, 8):
+                    filter_str = filter_str[:-1]
+                elif 32 <= fkey <= 126:
+                    filter_str += chr(fkey)
+            curses.curs_set(0)
+            status = f"Filter: '{filter_str}'  ({len(models)} results)" if filter_str else "Filter cleared."
+
+        # ── Launch ──
         elif key in (10, 13, curses.KEY_ENTER):
+            if not models:
+                status = "No models to launch."
+                continue
             model = models[sel]
             persist_cfg(model, cfg, all_saved)
             cmd = build_command(model, cfg)
