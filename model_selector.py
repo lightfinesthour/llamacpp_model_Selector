@@ -7,11 +7,15 @@ Per-model settings are saved to model_settings.json next to this script.
 """
 
 import sys
+import os
 import json
 import subprocess
 import curses
 import time
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).parent / ".env")
 
 LLAMA_SERVER = r"C:\tools\llamacpp\llama-server.exe"
 MODEL_DIRS   = [r"C:\llm", r"E:\llm"]
@@ -21,8 +25,8 @@ DEFAULTS = {
     "ngl":          999,
     "threads":      12,
     "context":      32768,
-    "host":         "REDACTED_HOST",
-    "port":         8080,
+    "host":         os.getenv("LLAMA_HOST", "127.0.0.1"),
+    "port":         int(os.getenv("LLAMA_PORT", "8080")),
     "flash_attn":   True,
     "cache_type_k": None,
     "cache_type_v": None,

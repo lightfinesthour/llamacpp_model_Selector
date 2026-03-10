@@ -1,3 +1,7 @@
 model_settings.json
 .claude/
 model_selector.bat
+.env
+replacements.txt
+__pycache__/
+*.pyc
