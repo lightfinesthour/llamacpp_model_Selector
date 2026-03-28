@@ -43,6 +43,7 @@ DEFAULTS = {
     "reasoning_format": None,
     "repeat_penalty":   1.02,
     "jinja":            False,
+    "visual_model":     None,       # None=auto (same folder), "none"=disabled, or path to mmproj
 }
 
 CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 200000, 262144]
@@ -139,6 +140,20 @@ def find_mmproj(model_path: Path):
     return None
 
 
+def find_all_mmproj():
+    """Recursively scan all model dirs for mmproj-*.gguf files."""
+    found = []
+    for base in MODEL_DIRS:
+        p = Path(base)
+        if not p.exists():
+            continue
+        for f in sorted(p.rglob("*.gguf")):
+            n = f.name.lower()
+            if n.startswith("mmproj-") or ("mmproj" in n or "projector" in n):
+                found.append(f)
+    return found
+
+
 def fmt_size(path: Path) -> str:
     try:
         b = path.stat().st_size
@@ -155,9 +170,18 @@ def fmt_size(path: Path) -> str:
 
 def build_command(model: Path, cfg: dict) -> list:
     cmd = [LLAMA_SERVER, "-m", str(model)]
-    mmproj = find_mmproj(model)
-    if mmproj:
-        cmd += ["--mmproj", str(mmproj), "--image-min-tokens", "1024"]
+    visual = cfg.get("visual_model")
+    if visual == "none":
+        pass  # explicitly disabled
+    elif visual and visual != "none":
+        vpath = Path(visual)
+        if vpath.exists():
+            cmd += ["--mmproj", str(vpath), "--image-min-tokens", "1024"]
+    else:
+        # auto-detect from same folder
+        mmproj = find_mmproj(model)
+        if mmproj:
+            cmd += ["--mmproj", str(mmproj), "--image-min-tokens", "1024"]
     cmd += ["-ngl", str(cfg["ngl"])]
     cmd += ["-c",   str(cfg["context"])]
     cmd += ["--threads", str(cfg["threads"])]
@@ -192,6 +216,7 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--reasoning-budget", str(cfg["thinking_budget"])]
     if cfg.get("reasoning_format") is not None:
         cmd += ["--reasoning-format", cfg["reasoning_format"]]
+    cmd += ["--parallel", "1"]
     if cfg.get("jinja"):
         cmd += ["--jinja"]
     if cfg.get("repeat_penalty") is not None:
@@ -235,8 +260,14 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
 
     # Settings bar
     if models:
-        mmproj      = find_mmproj(models[sel])
-        vision_tag  = " [V]" if mmproj else ""
+        visual = cfg.get("visual_model")
+        if visual == "none":
+            vision_tag = " [V:off]"
+        elif visual:
+            vision_tag = f" [V:{Path(visual).name}]"
+        else:
+            mmproj = find_mmproj(models[sel])
+            vision_tag = " [V]" if mmproj else ""
         ctk         = cfg.get("cache_type_k") or "-"
         ctv         = cfg.get("cache_type_v") or "-"
         verb        = cfg.get("verbosity")
@@ -296,7 +327,14 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         idx       = i + offset
         label     = short_label(model, base_dirs)
         size_str  = fmt_size(model)
-        has_vision = find_mmproj(model) is not None
+        m_cfg = cfg_for_model(model, all_saved)
+        m_visual = m_cfg.get("visual_model")
+        if m_visual == "none":
+            has_vision = False
+        elif m_visual:
+            has_vision = True
+        else:
+            has_vision = find_mmproj(model) is not None
         has_saved  = str(model) in {k for k in all_saved if k != "__meta__"}
         launched   = last_launch_time(model, all_saved)
         recency    = ">" if launched else " "
@@ -358,6 +396,13 @@ def inline_edit(stdscr, label, current_val):
 # ── Settings menu ─────────────────────────────────────────────────────────────
 
 def settings_menu(stdscr, cfg):
+    # Build visual model options: None (auto), "none" (disabled), then all found mmproj files
+    all_mmproj = find_all_mmproj()
+    visual_options = [None, "none"] + [str(f) for f in all_mmproj]
+    visual_labels = {None: "auto (same folder)", "none": "disabled"}
+    for f in all_mmproj:
+        visual_labels[str(f)] = f"{f.name}  ({f.parent})"
+
     fields = [
         ("context",      "Context length",     CONTEXT_OPTIONS),
         ("threads",      "Threads",            THREAD_OPTIONS),
@@ -379,6 +424,7 @@ def settings_menu(stdscr, cfg):
         ("reasoning_format", "Reasoning format",        REASONING_FORMAT_OPTIONS),
         ("jinja",            "Jinja templates (--jinja)", [False, True]),
         ("repeat_penalty", "Repeat penalty",           REPEAT_PENALTY_OPTIONS),
+        ("visual_model",   "Visual model (mmproj)",    visual_options),
     ]
     sel = 0
 
@@ -395,6 +441,8 @@ def settings_menu(stdscr, cfg):
             val = cfg.get(key)
             if key == "thinking":
                 display = {None: "default", True: "on", False: "off"}.get(val, str(val))
+            elif key == "visual_model":
+                display = visual_labels.get(val, Path(val).name if val else "auto (same folder)")
             else:
                 display = str(val) if val is not None else "default"
             editable_marker = "[*]" if key in EDITABLE_FIELDS else "   "
