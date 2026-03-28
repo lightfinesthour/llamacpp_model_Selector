@@ -23,25 +23,46 @@ SETTINGS_FILE = Path(__file__).parent / "model_settings.json"
 
 DEFAULTS = {
     "ngl":          999,
-    "threads":      12,
+    "threads":      24,
     "context":      32768,
     "host":         os.getenv("LLAMA_HOST", "127.0.0.1"),
     "port":         int(os.getenv("LLAMA_PORT", "8080")),
     "flash_attn":   True,
-    "cache_type_k": None,
-    "cache_type_v": None,
-    "verbosity":    None,
-    "np":           None,
-    "batch":        None,
+    "cache_type_k": "q8_0",
+    "cache_type_v": "q8_0",
+    "verbosity":    3,
+    "np":           1,
+    "batch":        512,
     "ubatch":       None,
-    "mlock":        False,
+    "mlock":           False,
+    "temp":            0.75,
+    "top_p":           None,
+    "top_k":           None,
+    "thinking":         None,
+    "thinking_budget":  None,
+    "reasoning_format": None,
+    "repeat_penalty":   1.02,
+    "jinja":            False,
 }
 
-CONTEXT_OPTIONS = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 200000]
-THREAD_OPTIONS  = [4, 8, 12, 16, 20, 24, 32]
-CACHE_OPTIONS   = [None, "q8_0", "q6_0", "q5_0", "q4_0", "q3_0"]
-NP_OPTIONS      = [None, 1, 2, 3, 4, 6, 8]
-BATCH_OPTIONS   = [None, 256, 512, 1024, 2048, 4096]
+CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 200000, 262144]
+THREAD_OPTIONS   = [4, 8, 12, 16, 20, 24, 32]
+CACHE_OPTIONS    = [None, "q8_0", "q6_0", "q5_0", "q4_0", "q3_0"]
+NP_OPTIONS       = [None, 1, 2, 3, 4, 6, 8]
+BATCH_OPTIONS    = [None, 256, 512, 1024, 2048, 4096]
+TEMP_OPTIONS     = [None, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0, 1.2, 1.5]
+TOP_P_OPTIONS    = [None, 0.1, 0.5, 0.8, 0.9, 0.95, 1.0]
+TOP_K_OPTIONS    = [None, 0, 10, 20, 40, 80, 100]
+THINKING_OPTIONS         = [None, True, False]    # None=default, True=on, False=off
+THINKING_BUDGET_OPTIONS  = [None, 256, 1024, 4096, 8192, 16384, 32768]
+REASONING_FORMAT_OPTIONS = [None, "deepseek", "deepseek-legacy", "none"]
+# deepseek        → extracts thinking into reasoning_content (Open WebUI shows collapsible dropdown)
+# deepseek-legacy → keeps <think> tags in content but also populates reasoning_content
+# none            → strips all thinking tags from output entirely
+REPEAT_PENALTY_OPTIONS   = [None, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3, 1.5]
+
+# Fields that support direct text entry for precision
+EDITABLE_FIELDS = {"temp", "top_p", "top_k", "repeat_penalty"}
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -66,15 +87,21 @@ def cfg_for_model(model: Path, all_saved: dict) -> dict:
     return cfg
 
 
-def persist_cfg(model: Path, cfg: dict, all_saved: dict):
-    delta = {k: v for k, v in cfg.items() if v != DEFAULTS.get(k)}
+def persist_cfg(model: Path, cfg: dict, all_saved: dict, is_launch: bool = False):
+    # Only save keys that differ from DEFAULTS; skip host (env-managed)
+    skip = {"host"}
+    delta = {k: v for k, v in cfg.items()
+             if k not in skip and v != DEFAULTS.get(k)}
     if delta:
         all_saved[str(model)] = delta
     elif str(model) in all_saved:
         del all_saved[str(model)]
-    # record launch time separately
+    # record per-model launch time and the last-used model
     meta = all_saved.setdefault("__meta__", {})
-    meta[str(model)] = {"last_launch": time.time()}
+    entry = meta.setdefault(str(model), {})
+    if is_launch:
+        entry["last_launch"] = time.time()
+    meta["__last_model__"] = str(model)
     save_settings(all_saved)
 
 
@@ -151,6 +178,24 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["-ub", str(cfg["ubatch"])]
     if cfg.get("mlock"):
         cmd += ["--mlock"]
+    if cfg.get("temp") is not None:
+        cmd += ["--temp", str(cfg["temp"])]
+    if cfg.get("top_p") is not None:
+        cmd += ["--top-p", str(cfg["top_p"])]
+    if cfg.get("top_k") is not None:
+        cmd += ["--top-k", str(cfg["top_k"])]
+    if cfg.get("thinking") is True:
+        cmd += ["--reasoning", "on"]
+    elif cfg.get("thinking") is False:
+        cmd += ["--reasoning", "off"]
+    if cfg.get("thinking_budget") is not None:
+        cmd += ["--reasoning-budget", str(cfg["thinking_budget"])]
+    if cfg.get("reasoning_format") is not None:
+        cmd += ["--reasoning-format", cfg["reasoning_format"]]
+    if cfg.get("jinja"):
+        cmd += ["--jinja"]
+    if cfg.get("repeat_penalty") is not None:
+        cmd += ["--repeat-penalty", str(cfg["repeat_penalty"])]
     return cmd
 
 
@@ -213,6 +258,20 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         if bat  is not None:  parts.append(f"b={bat}")
         if ubat is not None:  parts.append(f"ub={ubat}")
         if cfg.get("mlock"):  parts.append("mlock")
+        if cfg.get("temp")  is not None: parts.append(f"temp={cfg['temp']}")
+        if cfg.get("top_p") is not None: parts.append(f"top_p={cfg['top_p']}")
+        if cfg.get("top_k") is not None: parts.append(f"top_k={cfg['top_k']}")
+        thinking = cfg.get("thinking")
+        if thinking is not None:
+            parts.append(f"think={'on' if thinking else 'off'}")
+        if cfg.get("thinking_budget") is not None:
+            parts.append(f"budget={cfg['thinking_budget']}")
+        if cfg.get("reasoning_format") is not None:
+            parts.append(f"rfmt={cfg['reasoning_format']}")
+        if cfg.get("jinja"):
+            parts.append("jinja")
+        if cfg.get("repeat_penalty") is not None:
+            parts.append(f"rep={cfg['repeat_penalty']}")
         settings_str = " " + "  ".join(parts) + vision_tag + saved_mark
     else:
         settings_str = " (no models)"
@@ -267,6 +326,35 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
     stdscr.refresh()
 
 
+# ── Inline value editor ───────────────────────────────────────────────────────
+
+def inline_edit(stdscr, label, current_val):
+    """Show a bottom-bar text input; returns parsed value or None on cancel."""
+    h, w = stdscr.getmaxyx()
+    curses.curs_set(1)
+    buf = "" if current_val is None else str(current_val)
+    while True:
+        prompt = f" Enter {label} (blank=default, Esc=cancel): {buf}_"
+        stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        stdscr.addstr(h - 1, 0, prompt[:w - 1].ljust(w - 1))
+        stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+        stdscr.refresh()
+        ch = stdscr.getch()
+        if ch in (10, 13):          # Enter — confirm
+            curses.curs_set(0)
+            s = buf.strip()
+            if s == "" or s.lower() == "none":
+                return None
+            return s
+        elif ch == 27:              # Esc — cancel
+            curses.curs_set(0)
+            return current_val      # unchanged
+        elif ch in (curses.KEY_BACKSPACE, 127, 8):
+            buf = buf[:-1]
+        elif 32 <= ch <= 126:
+            buf += chr(ch)
+
+
 # ── Settings menu ─────────────────────────────────────────────────────────────
 
 def settings_menu(stdscr, cfg):
@@ -282,7 +370,15 @@ def settings_menu(stdscr, cfg):
         ("np",           "Parallel slots (-np)", NP_OPTIONS),
         ("batch",        "Batch size (-b)",    BATCH_OPTIONS),
         ("ubatch",       "Micro-batch (-ub)",  BATCH_OPTIONS),
-        ("mlock",        "mlock (pin in RAM)", [False, True]),
+        ("mlock",          "mlock (pin in RAM)",      [False, True]),
+        ("temp",           "Temperature (--temp)",    TEMP_OPTIONS),
+        ("top_p",          "Top-P (--top-p)",         TOP_P_OPTIONS),
+        ("top_k",          "Top-K (--top-k)",         TOP_K_OPTIONS),
+        ("thinking",         "Thinking (on/off)",       THINKING_OPTIONS),
+        ("thinking_budget",  "Thinking budget (tokens)", THINKING_BUDGET_OPTIONS),
+        ("reasoning_format", "Reasoning format",        REASONING_FORMAT_OPTIONS),
+        ("jinja",            "Jinja templates (--jinja)", [False, True]),
+        ("repeat_penalty", "Repeat penalty",           REPEAT_PENALTY_OPTIONS),
     ]
     sel = 0
 
@@ -291,14 +387,18 @@ def settings_menu(stdscr, cfg):
         h, w = stdscr.getmaxyx()
         stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
         stdscr.addstr(0, 0,
-            " Settings  |  up/down=field  left/right or +/-=value  enter/q=back"
+            " Settings  |  up/down=field  left/right or +/-=value  enter=edit[*]  q=back"
             .ljust(w-1))
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
         for i, (key, label, options) in enumerate(fields):
-            val     = cfg.get(key)
-            display = str(val) if val is not None else "default"
-            line    = f"  {label:<26} {display}"
+            val = cfg.get(key)
+            if key == "thinking":
+                display = {None: "default", True: "on", False: "off"}.get(val, str(val))
+            else:
+                display = str(val) if val is not None else "default"
+            editable_marker = "[*]" if key in EDITABLE_FIELDS else "   "
+            line = f"  {editable_marker} {label:<26} {display}"
             if i == sel:
                 stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
                 stdscr.addstr(2 + i, 0, line[:w-1].ljust(w-1))
@@ -309,8 +409,21 @@ def settings_menu(stdscr, cfg):
         stdscr.refresh()
         key = stdscr.getch()
 
-        if key in (ord('q'), ord('s'), 27, 10, 13):
+        if key in (ord('q'), ord('s'), 27):
             break
+        elif key in (10, 13):
+            fkey, flabel, _ = fields[sel]
+            if fkey in EDITABLE_FIELDS:
+                raw = inline_edit(stdscr, flabel, cfg.get(fkey))
+                if raw is None:
+                    cfg[fkey] = None
+                else:
+                    try:
+                        cfg[fkey] = int(raw) if fkey == "top_k" else float(raw)
+                    except ValueError:
+                        pass  # leave unchanged on bad input
+            else:
+                break
         elif key == curses.KEY_UP:
             sel = (sel - 1) % len(fields)
         elif key == curses.KEY_DOWN:
@@ -344,7 +457,7 @@ def main(stdscr):
     curses.curs_set(0)
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_BLACK,  curses.COLOR_CYAN)    # header
+    curses.init_pair(1, curses.COLOR_WHITE,  curses.COLOR_BLUE)    # header
     curses.init_pair(2, curses.COLOR_BLACK,  curses.COLOR_YELLOW)  # selected
     curses.init_pair(3, curses.COLOR_CYAN,   -1)                   # settings bar
     curses.init_pair(4, curses.COLOR_WHITE,  curses.COLOR_BLACK)   # cmd preview
@@ -369,7 +482,15 @@ def main(stdscr):
     sort_mode  = "name"
     filter_str = ""
     models     = apply_sort(filter_models(all_models, filter_str), sort_mode, all_saved)
-    sel        = 0
+
+    # Restore cursor to last used model
+    last_model_str = all_saved.get("__meta__", {}).get("__last_model__")
+    sel = 0
+    if last_model_str:
+        last_path = Path(last_model_str)
+        if last_path in models:
+            sel = models.index(last_path)
+
     cfg        = cfg_for_model(models[sel], all_saved)
     status     = f"Found {len(all_models)} models.   [V]=vision  *=saved  >=launched"
 
@@ -403,7 +524,7 @@ def main(stdscr):
         # ── Settings ──
         elif key in (ord('s'), ord('S')):
             settings_menu(stdscr, cfg)
-            persist_cfg(models[sel], cfg, all_saved)
+            persist_cfg(models[sel], cfg, all_saved, is_launch=False)
             status = "Settings saved."
 
         # ── Delete saved settings ──
@@ -462,7 +583,7 @@ def main(stdscr):
                 status = "No models to launch."
                 continue
             model = models[sel]
-            persist_cfg(model, cfg, all_saved)
+            persist_cfg(model, cfg, all_saved, is_launch=True)
             cmd = build_command(model, cfg)
             curses.endwin()
             print("Launching:")
@@ -473,4 +594,7 @@ def main(stdscr):
 
 
 if __name__ == "__main__":
+    # Request terminal resize via VT escape sequence (works in Windows Terminal)
+    sys.stdout.write("\033[8;50;220t")
+    sys.stdout.flush()
     curses.wrapper(main)
