@@ -23,7 +23,7 @@ SETTINGS_FILE = Path(__file__).parent / "model_settings.json"
 
 DEFAULTS = {
     "ngl":          999,
-    "threads":      24,
+    "threads":      16,
     "context":      32768,
     "host":         os.getenv("LLAMA_HOST", "127.0.0.1"),
     "port":         int(os.getenv("LLAMA_PORT", "8080")),
@@ -31,13 +31,12 @@ DEFAULTS = {
     "cache_type_k": "q8_0",
     "cache_type_v": "q8_0",
     "verbosity":    3,
-    "np":           1,
     "batch":        512,
     "ubatch":       None,
     "mlock":           False,
-    "temp":            0.75,
-    "top_p":           None,
-    "top_k":           None,
+    "temp":            0.6,
+    "top_p":           0.95,
+    "top_k":           20,
     "thinking":         None,
     "thinking_budget":  None,
     "reasoning_format": None,
@@ -49,7 +48,6 @@ DEFAULTS = {
 CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 200000, 262144]
 THREAD_OPTIONS   = [4, 8, 12, 16, 20, 24, 32]
 CACHE_OPTIONS    = [None, "q8_0", "q6_0", "q5_0", "q4_0", "q3_0"]
-NP_OPTIONS       = [None, 1, 2, 3, 4, 6, 8]
 BATCH_OPTIONS    = [None, 256, 512, 1024, 2048, 4096]
 TEMP_OPTIONS     = [None, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0, 1.2, 1.5]
 TOP_P_OPTIONS    = [None, 0.1, 0.5, 0.8, 0.9, 0.95, 1.0]
@@ -194,8 +192,6 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["-ctv", cfg["cache_type_v"]]
     if cfg.get("verbosity") is not None:
         cmd += ["--verbosity", str(cfg["verbosity"])]
-    if cfg.get("np"):
-        cmd += ["-np", str(cfg["np"])]
     if cfg.get("batch"):
         cmd += ["-b", str(cfg["batch"])]
     if cfg.get("ubatch"):
@@ -271,7 +267,6 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         ctk         = cfg.get("cache_type_k") or "-"
         ctv         = cfg.get("cache_type_v") or "-"
         verb        = cfg.get("verbosity")
-        np_         = cfg.get("np")
         bat         = cfg.get("batch")
         ubat        = cfg.get("ubatch")
         saved_mark  = " [saved]" if str(models[sel]) in {k for k in all_saved if k != "__meta__"} else ""
@@ -285,7 +280,6 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
             f"ctv={ctv}",
         ]
         if verb is not None:  parts.append(f"verb={verb}")
-        if np_  is not None:  parts.append(f"np={np_}")
         if bat  is not None:  parts.append(f"b={bat}")
         if ubat is not None:  parts.append(f"ub={ubat}")
         if cfg.get("mlock"):  parts.append("mlock")
@@ -412,7 +406,6 @@ def settings_menu(stdscr, cfg):
         ("cache_type_k", "Cache K (-ctk)",     CACHE_OPTIONS),
         ("cache_type_v", "Cache V (-ctv)",     CACHE_OPTIONS),
         ("verbosity",    "Verbosity",          [None, 0, 1, 2, 3, 4, 5]),
-        ("np",           "Parallel slots (-np)", NP_OPTIONS),
         ("batch",        "Batch size (-b)",    BATCH_OPTIONS),
         ("ubatch",       "Micro-batch (-ub)",  BATCH_OPTIONS),
         ("mlock",          "mlock (pin in RAM)",      [False, True]),
