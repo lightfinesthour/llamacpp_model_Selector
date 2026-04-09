@@ -37,6 +37,7 @@ DEFAULTS = {
     "temp":            0.6,
     "top_p":           0.95,
     "top_k":           20,
+    "min_p":           None,
     "thinking":         None,
     "thinking_budget":  None,
     "reasoning_format": None,
@@ -53,6 +54,7 @@ BATCH_OPTIONS    = [None, 256, 512, 1024, 2048, 4096]
 TEMP_OPTIONS     = [None, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0, 1.2, 1.5]
 TOP_P_OPTIONS    = [None, 0.1, 0.5, 0.8, 0.9, 0.95, 1.0]
 TOP_K_OPTIONS    = [None, 0, 10, 20, 40, 80, 100]
+MIN_P_OPTIONS    = [None, 0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2]
 THINKING_OPTIONS         = [None, True, False]    # None=default, True=on, False=off
 THINKING_BUDGET_OPTIONS  = [None, 256, 1024, 4096, 8192, 16384, 32768]
 REASONING_FORMAT_OPTIONS = [None, "deepseek", "deepseek-legacy", "none"]
@@ -62,7 +64,7 @@ REASONING_FORMAT_OPTIONS = [None, "deepseek", "deepseek-legacy", "none"]
 REPEAT_PENALTY_OPTIONS   = [None, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3, 1.5]
 
 # Fields that support direct text entry for precision
-EDITABLE_FIELDS = {"temp", "top_p", "top_k", "repeat_penalty"}
+EDITABLE_FIELDS = {"temp", "top_p", "top_k", "min_p", "repeat_penalty"}
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -205,6 +207,8 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--top-p", str(cfg["top_p"])]
     if cfg.get("top_k") is not None:
         cmd += ["--top-k", str(cfg["top_k"])]
+    if cfg.get("min_p") is not None:
+        cmd += ["--min-p", str(cfg["min_p"])]
     if cfg.get("thinking") is True:
         cmd += ["--reasoning", "on"]
     elif cfg.get("thinking") is False:
@@ -289,6 +293,7 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         if cfg.get("temp")  is not None: parts.append(f"temp={cfg['temp']}")
         if cfg.get("top_p") is not None: parts.append(f"top_p={cfg['top_p']}")
         if cfg.get("top_k") is not None: parts.append(f"top_k={cfg['top_k']}")
+        if cfg.get("min_p") is not None: parts.append(f"min_p={cfg['min_p']}")
         thinking = cfg.get("thinking")
         if thinking is not None:
             parts.append(f"think={'on' if thinking else 'off'}")
@@ -417,6 +422,7 @@ def settings_menu(stdscr, cfg):
         ("temp",           "Temperature (--temp)",    TEMP_OPTIONS),
         ("top_p",          "Top-P (--top-p)",         TOP_P_OPTIONS),
         ("top_k",          "Top-K (--top-k)",         TOP_K_OPTIONS),
+        ("min_p",          "Min-P (--min-p)",         MIN_P_OPTIONS),
         ("thinking",         "Thinking (on/off)",       THINKING_OPTIONS),
         ("thinking_budget",  "Thinking budget (tokens)", THINKING_BUDGET_OPTIONS),
         ("reasoning_format", "Reasoning format",        REASONING_FORMAT_OPTIONS),
