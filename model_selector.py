@@ -47,7 +47,7 @@ DEFAULTS = {
 
 CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 200000, 262144]
 THREAD_OPTIONS   = [4, 8, 12, 16, 20, 24, 32]
-CACHE_OPTIONS    = [None, "q8_0", "q6_0", "q5_0", "q4_0", "q3_0"]
+CACHE_OPTIONS    = [None, "f16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"]
 BATCH_OPTIONS    = [None, 256, 512, 1024, 2048, 4096]
 TEMP_OPTIONS     = [None, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0, 1.2, 1.5]
 TOP_P_OPTIONS    = [None, 0.1, 0.5, 0.8, 0.9, 0.95, 1.0]
@@ -174,12 +174,12 @@ def build_command(model: Path, cfg: dict) -> list:
     elif visual and visual != "none":
         vpath = Path(visual)
         if vpath.exists():
-            cmd += ["--mmproj", str(vpath), "--image-min-tokens", "1024"]
+            cmd += ["--mmproj", str(vpath)]
     else:
         # auto-detect from same folder
         mmproj = find_mmproj(model)
         if mmproj:
-            cmd += ["--mmproj", str(mmproj), "--image-min-tokens", "1024"]
+            cmd += ["--mmproj", str(mmproj)]
     cmd += ["-ngl", str(cfg["ngl"])]
     cmd += ["-c",   str(cfg["context"])]
     cmd += ["--threads", str(cfg["threads"])]

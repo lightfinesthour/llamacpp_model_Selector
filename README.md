@@ -62,7 +62,7 @@ Navigate fields with `↑ / ↓`, change values with `← / →` or `+` / `-`. S
 
 ## Vision Models
 
-If a `mmproj-*.gguf` file is found in the same directory as the selected model, the selector automatically adds `--mmproj` and `--image-min-tokens 1024` to the launch command. Vision-capable models are tagged `[V]` in the list.
+If a `mmproj-*.gguf` file is found in the same directory as the selected model, the selector automatically adds `--mmproj` to the launch command. Vision-capable models are tagged `[V]` in the list.
 
 ## Model Directories
 
