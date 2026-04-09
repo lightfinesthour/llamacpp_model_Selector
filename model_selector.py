@@ -42,6 +42,7 @@ DEFAULTS = {
     "reasoning_format": None,
     "repeat_penalty":   1.02,
     "jinja":            False,
+    "gemma4_template_fix": False,   # Temp fix: adds --chat-template-file for Gemma 4 models
     "visual_model":     None,       # None=auto (same folder), "none"=disabled, or path to mmproj
 }
 
@@ -215,6 +216,8 @@ def build_command(model: Path, cfg: dict) -> list:
     cmd += ["--parallel", "1"]
     if cfg.get("jinja"):
         cmd += ["--jinja"]
+    if cfg.get("gemma4_template_fix"):
+        cmd += ["--chat-template-file", r"C:\tools\llamacpp\templates\google-gemma-4-31B-it-interleaved.jinja"]
     if cfg.get("repeat_penalty") is not None:
         cmd += ["--repeat-penalty", str(cfg["repeat_penalty"])]
     return cmd
@@ -295,6 +298,8 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
             parts.append(f"rfmt={cfg['reasoning_format']}")
         if cfg.get("jinja"):
             parts.append("jinja")
+        if cfg.get("gemma4_template_fix"):
+            parts.append("g4fix")
         if cfg.get("repeat_penalty") is not None:
             parts.append(f"rep={cfg['repeat_penalty']}")
         settings_str = " " + "  ".join(parts) + vision_tag + saved_mark
@@ -416,6 +421,7 @@ def settings_menu(stdscr, cfg):
         ("thinking_budget",  "Thinking budget (tokens)", THINKING_BUDGET_OPTIONS),
         ("reasoning_format", "Reasoning format",        REASONING_FORMAT_OPTIONS),
         ("jinja",            "Jinja templates (--jinja)", [False, True]),
+        ("gemma4_template_fix", "Gemma 4 template fix",  [False, True]),
         ("repeat_penalty", "Repeat penalty",           REPEAT_PENALTY_OPTIONS),
         ("visual_model",   "Visual model (mmproj)",    visual_options),
     ]
