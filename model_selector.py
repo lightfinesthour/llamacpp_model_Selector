@@ -18,11 +18,10 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 LLAMA_SERVER = r"C:\tools\llamacpp\llama-server.exe"
-MODEL_DIRS   = [r"C:\llm", r"E:\llm"]
+MODEL_DIRS   = [r"C:\llm", r"E:\llm", r"K:\models"]
 SETTINGS_FILE = Path(__file__).parent / "model_settings.json"
 
 DEFAULTS = {
-    "ngl":          999,
     "threads":      16,
     "context":      32768,
     "host":         os.getenv("LLAMA_HOST", "127.0.0.1"),
@@ -33,6 +32,7 @@ DEFAULTS = {
     "verbosity":    3,
     "batch":        512,
     "ubatch":       None,
+    "no_mmap":         False,
     "mlock":           False,
     "temp":            0.6,
     "top_p":           0.95,
@@ -47,7 +47,7 @@ DEFAULTS = {
     "visual_model":     None,       # None=auto (same folder), "none"=disabled, or path to mmproj
 }
 
-CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 200000, 262144]
+CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 150000,200000, 262144]
 THREAD_OPTIONS   = [4, 8, 12, 16, 20, 24, 32]
 CACHE_OPTIONS    = [None, "f16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"]
 BATCH_OPTIONS    = [None, 256, 512, 1024, 2048, 4096]
@@ -183,7 +183,7 @@ def build_command(model: Path, cfg: dict) -> list:
         mmproj = find_mmproj(model)
         if mmproj:
             cmd += ["--mmproj", str(mmproj)]
-    cmd += ["-ngl", str(cfg["ngl"])]
+    cmd += ["-ngl", "-1"]
     cmd += ["-c",   str(cfg["context"])]
     cmd += ["--threads", str(cfg["threads"])]
     if cfg["flash_attn"]:
@@ -199,6 +199,8 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["-b", str(cfg["batch"])]
     if cfg.get("ubatch"):
         cmd += ["-ub", str(cfg["ubatch"])]
+    if cfg.get("no_mmap"):
+        cmd += ["--no-mmap"]
     if cfg.get("mlock"):
         cmd += ["--mlock"]
     if cfg.get("temp") is not None:
@@ -280,7 +282,6 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         parts = [
             f"ctx={cfg['context']}",
             f"threads={cfg['threads']}",
-            f"ngl={cfg['ngl']}",
             f"port={cfg['port']}",
             f"fa={'on' if cfg['flash_attn'] else 'off'}",
             f"ctk={ctk}",
@@ -289,6 +290,7 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         if verb is not None:  parts.append(f"verb={verb}")
         if bat  is not None:  parts.append(f"b={bat}")
         if ubat is not None:  parts.append(f"ub={ubat}")
+        if cfg.get("no_mmap"): parts.append("no-mmap")
         if cfg.get("mlock"):  parts.append("mlock")
         if cfg.get("temp")  is not None: parts.append(f"temp={cfg['temp']}")
         if cfg.get("top_p") is not None: parts.append(f"top_p={cfg['top_p']}")
@@ -410,7 +412,6 @@ def settings_menu(stdscr, cfg):
     fields = [
         ("context",      "Context length",     CONTEXT_OPTIONS),
         ("threads",      "Threads",            THREAD_OPTIONS),
-        ("ngl",          "GPU layers (-ngl)",  None),
         ("port",         "Port",               None),
         ("flash_attn",   "Flash attention",    [True, False]),
         ("cache_type_k", "Cache K (-ctk)",     CACHE_OPTIONS),
@@ -418,6 +419,7 @@ def settings_menu(stdscr, cfg):
         ("verbosity",    "Verbosity",          [None, 0, 1, 2, 3, 4, 5]),
         ("batch",        "Batch size (-b)",    BATCH_OPTIONS),
         ("ubatch",       "Micro-batch (-ub)",  BATCH_OPTIONS),
+        ("no_mmap",        "No mmap (load to RAM)",   [False, True]),
         ("mlock",          "mlock (pin in RAM)",      [False, True]),
         ("temp",           "Temperature (--temp)",    TEMP_OPTIONS),
         ("top_p",          "Top-P (--top-p)",         TOP_P_OPTIONS),
@@ -489,9 +491,7 @@ def settings_menu(stdscr, cfg):
                 idx = options.index(cur) if cur in options else 0
                 cfg[fkey] = options[(idx + direction) % len(options)]
             else:
-                if fkey == "ngl":
-                    cfg[fkey] = max(0, cfg[fkey] + direction)
-                elif fkey == "port":
+                if fkey == "port":
                     cfg[fkey] = max(1024, cfg[fkey] + direction)
 
 
