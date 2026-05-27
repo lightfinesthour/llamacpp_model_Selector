@@ -32,8 +32,8 @@ DEFAULTS = {
     "verbosity":    3,
     "batch":        512,
     "ubatch":       None,
-    "no_mmap":         False,
-    "mlock":           False,
+    "no_mmap":         True,
+    "mlock":           True,
     "temp":            0.6,
     "top_p":           0.95,
     "top_k":           20,
@@ -41,13 +41,14 @@ DEFAULTS = {
     "thinking":         None,
     "thinking_budget":  None,
     "reasoning_format": None,
-    "repeat_penalty":   1.02,
+    "repeat_penalty":   1.05,
     "jinja":            False,
     "gemma4_template_fix": False,   # Temp fix: adds --chat-template-file for Gemma 4 models
-    "visual_model":     None,       # None=auto (same folder), "none"=disabled, or path to mmproj
+    "draft_mtp":        False,       # Enable Multi-Token Prediction speculative decoding
+    "visual_model":     "none",     # None=auto (same folder), "none"=disabled, or path to mmproj
 }
 
-CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 150000,200000, 262144]
+CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 150000, 196608, 200000, 262144]
 THREAD_OPTIONS   = [4, 8, 12, 16, 20, 24, 32]
 CACHE_OPTIONS    = [None, "f16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"]
 BATCH_OPTIONS    = [None, 256, 512, 1024, 2048, 4096]
@@ -224,6 +225,8 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--jinja"]
     if cfg.get("gemma4_template_fix"):
         cmd += ["--chat-template-file", r"C:\tools\llamacpp\templates\google-gemma-4-31B-it-interleaved.jinja"]
+    if cfg.get("draft_mtp"):
+        cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2"]
     if cfg.get("repeat_penalty") is not None:
         cmd += ["--repeat-penalty", str(cfg["repeat_penalty"])]
     return cmd
@@ -307,6 +310,8 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
             parts.append("jinja")
         if cfg.get("gemma4_template_fix"):
             parts.append("g4fix")
+        if cfg.get("draft_mtp"):
+            parts.append("mtp")
         if cfg.get("repeat_penalty") is not None:
             parts.append(f"rep={cfg['repeat_penalty']}")
         settings_str = " " + "  ".join(parts) + vision_tag + saved_mark
@@ -430,6 +435,7 @@ def settings_menu(stdscr, cfg):
         ("reasoning_format", "Reasoning format",        REASONING_FORMAT_OPTIONS),
         ("jinja",            "Jinja templates (--jinja)", [False, True]),
         ("gemma4_template_fix", "Gemma 4 template fix",  [False, True]),
+        ("draft_mtp",      "Draft MTP (--draft-mtp)",  [False, True]),
         ("repeat_penalty", "Repeat penalty",           REPEAT_PENALTY_OPTIONS),
         ("visual_model",   "Visual model (mmproj)",    visual_options),
     ]
