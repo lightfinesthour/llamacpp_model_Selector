@@ -19,6 +19,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 LLAMA_SERVER = r"C:\tools\llamacpp\llama-server.exe"
 MODEL_DIRS   = [r"C:\llm", r"E:\llm", r"K:\models"]
+TEMPLATES_DIR = Path(r"C:\tools\llamacpp\templates")
 SETTINGS_FILE = Path(__file__).parent / "model_settings.json"
 
 DEFAULTS = {
@@ -38,12 +39,21 @@ DEFAULTS = {
     "top_p":           0.95,
     "top_k":           20,
     "min_p":           None,
+    # thinking=True emits --reasoning on, which makes the SERVER DEFAULT
+    # thinking-on. Note: the built-in WebUI can still override this per-request
+    # if its custom-JSON field sends chat_template_kwargs {"enable_thinking":
+    # false}. Keep that WebUI field EMPTY (or set it to enable_thinking: true)
+    # so the server default wins. The launcher cannot control that field; it is
+    # a per-request browser setting.
     "thinking":         None,
     "thinking_budget":  None,
-    "reasoning_format": None,
+    # deepseek puts thoughts in message.reasoning_content (clean separation the
+    # WebUI renders as a Thinking block). 'auto' also works; 'none' leaves
+    # thoughts inline in content.
+    "reasoning_format": "deepseek",
     "repeat_penalty":   1.05,
     "jinja":            False,
-    "gemma4_template_fix": False,   # Temp fix: adds --chat-template-file for Gemma 4 models
+    "auto_template":    False,   # Auto-match a curated .jinja template by model name
     "draft_mtp":        False,       # Enable Multi-Token Prediction speculative decoding
     "visual_model":     "none",     # None=auto (same folder), "none"=disabled, or path to mmproj
 }
@@ -57,7 +67,7 @@ TOP_P_OPTIONS    = [None, 0.1, 0.5, 0.8, 0.9, 0.95, 1.0]
 TOP_K_OPTIONS    = [None, 0, 10, 20, 40, 80, 100]
 MIN_P_OPTIONS    = [None, 0.0, 0.01, 0.02, 0.05, 0.1, 0.15, 0.2]
 THINKING_OPTIONS         = [None, True, False]    # None=default, True=on, False=off
-THINKING_BUDGET_OPTIONS  = [None, 256, 1024, 4096, 8192, 16384, 32768]
+THINKING_BUDGET_OPTIONS  = [None, 0, 256, 1024, 4096, 8192, 16384, 32768]
 REASONING_FORMAT_OPTIONS = [None, "deepseek", "deepseek-legacy", "none"]
 # deepseek        → extracts thinking into reasoning_content (Open WebUI shows collapsible dropdown)
 # deepseek-legacy → keeps <think> tags in content but also populates reasoning_content
@@ -73,10 +83,21 @@ EDITABLE_FIELDS = {"temp", "top_p", "top_k", "min_p", "repeat_penalty"}
 def load_saved_settings() -> dict:
     if SETTINGS_FILE.exists():
         try:
-            return json.loads(SETTINGS_FILE.read_text())
+            data = json.loads(SETTINGS_FILE.read_text())
+            return _migrate_settings(data)
         except Exception:
             pass
     return {}
+
+
+def _migrate_settings(data: dict) -> dict:
+    """Rename the retired gemma4_template_fix key to auto_template in place."""
+    for key, val in data.items():
+        if key == "__meta__" or not isinstance(val, dict):
+            continue
+        if "gemma4_template_fix" in val:
+            val["auto_template"] = val.pop("gemma4_template_fix")
+    return data
 
 
 def save_settings(all_saved: dict):
@@ -168,6 +189,70 @@ def fmt_size(path: Path) -> str:
         return "?"
 
 
+# ── Chat template matching ────────────────────────────────────────────────────
+
+def _normalize(name: str) -> str:
+    """Lowercase and strip separators so 'Qwen3.5-4B' ~ 'qwen3-5-4b' ~ 'qwen354b'."""
+    out = []
+    for ch in name.lower():
+        if ch.isalnum():
+            out.append(ch)
+    return "".join(out)
+
+
+def _template_tokens(stem: str) -> set:
+    """Split a template/model name into comparable family+version tokens."""
+    norm = stem.lower()
+    for sep in ("-", "_", ".", " "):
+        norm = norm.replace(sep, " ")
+    return {t for t in norm.split() if t}
+
+
+def find_template_for_model(model: Path):
+    """
+    Best-effort match of a local model file to a curated .jinja template in
+    TEMPLATES_DIR by name. Returns the template Path or None.
+
+    Strategy: score each template by how many of its name tokens appear in the
+    model filename, requiring the model-family token (first alpha token) to
+    match. Returns the highest-scoring template above a small threshold.
+    """
+    if not TEMPLATES_DIR.exists():
+        return None
+    model_norm = _normalize(model.stem)
+    model_tokens = _template_tokens(model.stem)
+
+    best = None
+    best_score = 0
+    for tpl in TEMPLATES_DIR.glob("*.jinja"):
+        tpl_tokens = _template_tokens(tpl.stem)
+        # Drop generic role suffixes and org-prefix noise that don't identify
+        # the model family (e.g. the "ai" in "deepseek-ai", "forai", "hf").
+        core = tpl_tokens - {"it", "instruct", "tool", "use", "default",
+                             "rag", "interleaved", "fixed", "bf16",
+                             "ai", "org", "hf", "team", "research", "forai"}
+        if not core:
+            continue
+        # Score by token overlap plus a strong bonus when the template's
+        # normalized stem appears directly in the model filename.
+        overlap = len(core & model_tokens)
+        # Strongest signal: the template's normalized stem appears in the model.
+        stem_hit = _normalize(tpl.stem.replace("interleaved", "")
+                                       .replace("fixed", "")) in model_norm
+        score = overlap + (5 if stem_hit else 0)
+        # Require a real family-name match, not just a shared size/quant token
+        # like "8b". The model must contain at least one alphabetic core token
+        # (e.g. "gemma", "deepseek", "qwen"); org prefixes were already dropped.
+        alpha_core = {t for t in core if any(c.isalpha() for c in t)}
+        shared_alpha = {t for t in alpha_core if _normalize(t) in model_norm}
+        if not shared_alpha:
+            continue
+        if score > best_score:
+            best_score, best = score, tpl
+    # Need the family token plus at least one more corroborating token.
+    return best if best_score >= 2 else None
+
+
 # ── Command builder ───────────────────────────────────────────────────────────
 
 def build_command(model: Path, cfg: dict) -> list:
@@ -212,6 +297,12 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--top-k", str(cfg["top_k"])]
     if cfg.get("min_p") is not None:
         cmd += ["--min-p", str(cfg["min_p"])]
+    # --reasoning on/off sets the server-side thinking default. If reasoning
+    # still does not appear in the built-in WebUI, check the WebUI's custom-JSON
+    # field: an un-nested {"enable_thinking": true} does NOTHING (the template
+    # only reads it nested as {"chat_template_kwargs": {"enable_thinking":
+    # true}}), and the WebUI's default sends enable_thinking:false, which wins
+    # over this flag per-request. Keeping that field EMPTY lets this flag win.
     if cfg.get("thinking") is True:
         cmd += ["--reasoning", "on"]
     elif cfg.get("thinking") is False:
@@ -220,15 +311,30 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--reasoning-budget", str(cfg["thinking_budget"])]
     if cfg.get("reasoning_format") is not None:
         cmd += ["--reasoning-format", cfg["reasoning_format"]]
-    cmd += ["--parallel", "1"]
-    if cfg.get("jinja"):
+    # Thinking is driven by --reasoning on/off (emitted above). The current
+    # llama.cpp build reads it from the template's thinking flag; the older
+    # --chat-template-kwargs '{"enable_thinking": ...}' path is now deprecated
+    # and warns at startup, so we no longer emit it.
+    # Auto-match a curated chat template by model name. When auto_template is on,
+    # find the best local .jinja for this model and pass it explicitly. Falls
+    # back to the embedded template.
+    matched_template = None
+    if cfg.get("auto_template"):
+        matched_template = find_template_for_model(model)
+    # A custom --chat-template-file is only honored on the Jinja code path
+    # (jinja is on by default in current builds, but force it to be explicit).
+    use_jinja = (cfg.get("jinja") or cfg.get("auto_template")
+                 or matched_template is not None)
+    if use_jinja:
         cmd += ["--jinja"]
-    if cfg.get("gemma4_template_fix"):
-        cmd += ["--chat-template-file", r"C:\tools\llamacpp\templates\google-gemma-4-31B-it-interleaved.jinja"]
+    if matched_template is not None:
+        cmd += ["--chat-template-file", str(matched_template)]
     if cfg.get("draft_mtp"):
         cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2"]
     if cfg.get("repeat_penalty") is not None:
         cmd += ["--repeat-penalty", str(cfg["repeat_penalty"])]
+    cmd += ["--parallel", "1"]
+    #cmd += ["--no-warmup"]
     return cmd
 
 
@@ -306,10 +412,11 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
             parts.append(f"budget={cfg['thinking_budget']}")
         if cfg.get("reasoning_format") is not None:
             parts.append(f"rfmt={cfg['reasoning_format']}")
-        if cfg.get("jinja"):
+        if cfg.get("jinja") or cfg.get("auto_template") or thinking is not None:
             parts.append("jinja")
-        if cfg.get("gemma4_template_fix"):
-            parts.append("g4fix")
+        if cfg.get("auto_template"):
+            tpl = find_template_for_model(models[sel])
+            parts.append(f"tpl={tpl.stem}" if tpl else "tpl=embedded")
         if cfg.get("draft_mtp"):
             parts.append("mtp")
         if cfg.get("repeat_penalty") is not None:
@@ -434,7 +541,7 @@ def settings_menu(stdscr, cfg):
         ("thinking_budget",  "Thinking budget (tokens)", THINKING_BUDGET_OPTIONS),
         ("reasoning_format", "Reasoning format",        REASONING_FORMAT_OPTIONS),
         ("jinja",            "Jinja templates (--jinja)", [False, True]),
-        ("gemma4_template_fix", "Gemma 4 template fix",  [False, True]),
+        ("auto_template",    "Auto-match chat template",  [False, True]),
         ("draft_mtp",      "Draft MTP (--draft-mtp)",  [False, True]),
         ("repeat_penalty", "Repeat penalty",           REPEAT_PENALTY_OPTIONS),
         ("visual_model",   "Visual model (mmproj)",    visual_options),
