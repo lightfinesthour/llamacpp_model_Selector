@@ -8,6 +8,7 @@ Per-model settings are saved to model_settings.json next to this script.
 
 import sys
 import os
+import re
 import json
 import subprocess
 import curses
@@ -18,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 LLAMA_SERVER = r"C:\tools\llamacpp\llama-server.exe"
-MODEL_DIRS   = [r"C:\llm", r"E:\llm", r"K:\models"]
+MODEL_DIRS   = [r"C:\llm", r"E:\llm", r"K:\models", r"M:\models"]
 TEMPLATES_DIR = Path(r"C:\tools\llamacpp\templates")
 SETTINGS_FILE = Path(__file__).parent / "model_settings.json"
 
@@ -51,6 +52,18 @@ DEFAULTS = {
     # WebUI renders as a Thinking block). 'auto' also works; 'none' leaves
     # thoughts inline in content.
     "reasoning_format": "deepseek",
+    # Chat-template kwarg for templates that gate thinking on reasoning_effort
+    # instead of enable_thinking (Hunyuan V3: no_think/low/high, defaults
+    # no_think; gpt-oss: low/medium/high). Sent as
+    # --chat-template-kwargs '{"reasoning_effort": ...}'; forces --jinja.
+    # None = flag omitted, template default applies.
+    "reasoning_effort": None,
+    # Keep thinking blocks from earlier assistant turns in the history instead
+    # of only the last one. Only works on templates that read a preserve_thinking
+    # kwarg (llama-server logs "chat template supports preserving reasoning" at
+    # startup when it applies). Better multi-turn coherence, costs context.
+    # None = flag omitted, template default applies.
+    "reasoning_preserve": None,
     "repeat_penalty":   1.05,
     "jinja":            False,
     "auto_template":    False,   # Auto-match a curated .jinja template by model name
@@ -72,10 +85,55 @@ REASONING_FORMAT_OPTIONS = [None, "deepseek", "deepseek-legacy", "none"]
 # deepseek        → extracts thinking into reasoning_content (Open WebUI shows collapsible dropdown)
 # deepseek-legacy → keeps <think> tags in content but also populates reasoning_content
 # none            → strips all thinking tags from output entirely
+# Union of values seen across templates; the settings menu narrows this to the
+# values the selected model's embedded template actually accepts.
+REASONING_EFFORT_OPTIONS = [None, "no_think", "low", "medium", "high"]
+REASONING_PRESERVE_OPTIONS = [None, True, False]  # None=template default
 REPEAT_PENALTY_OPTIONS   = [None, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3, 1.5]
 
 # Fields that support direct text entry for precision
 EDITABLE_FIELDS = {"temp", "top_p", "top_k", "min_p", "repeat_penalty"}
+
+
+# ── Hard-coded per-model fixes ────────────────────────────────────────────────
+# Applied automatically in build_command when the model path contains "match"
+# (case-insensitive). Overrides win over saved and default settings; no user
+# action needed. The settings bar shows FIX:<name> when one is active.
+#
+# deepseek-v4-flash (C:\llm\unsloth\DeepSeek-V4-Flash-GGUF):
+#   - The unsloth GGUF embeds a fixed DSML jinja template that is only honored
+#     on the --jinja code path, so jinja is forced on.
+#   - DeepSeek recommends temp=1.0, top_p=1.0, min_p=0.0 with no top-k and no
+#     repeat penalty; the launcher defaults (0.6 / 0.95 / 20 / 1.05) degrade it.
+#   - llama.cpp context checkpointing corrupts multi-turn output for this arch
+#     (gibberish from turn 2; fix PR #25402 not merged as of build 9898). A
+#     llama-server built from that PR lives in patches\deepseekv4flash and is
+#     used via "server" when present. If it is missing, the stock server runs
+#     with checkpoints disabled via "fallback_args" instead.
+MODEL_FIXES = [
+    {
+        "name": "dsv4-flash",
+        "match": "deepseek-v4-flash",
+        "overrides": {
+            "jinja":          True,
+            "temp":           1.0,
+            "top_p":          1.0,
+            "top_k":          0,      # 0 = top-k disabled in llama.cpp
+            "min_p":          0.0,
+            "repeat_penalty": None,   # flag omitted; server default 1.0 = off
+        },
+        "server": r"C:\tools\llamacpp\patches\deepseekv4flash\llama-server.exe",
+        "fallback_args": ["--ctx-checkpoints", "0"],
+    },
+]
+
+
+def find_model_fix(model: Path):
+    p = str(model).lower()
+    for fix in MODEL_FIXES:
+        if fix["match"] in p:
+            return fix
+    return None
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -151,6 +209,11 @@ def find_models():
             name = f.name.lower()
             if "mmproj" in name or "projector" in name:
                 continue
+            # Split GGUFs: only the first shard is launchable; llama-server
+            # picks up the rest of the -NNNNN-of-NNNNN set automatically.
+            shard = re.search(r"-(\d{5})-of-\d{5}\.gguf$", name)
+            if shard and shard.group(1) != "00001":
+                continue
             models.append(f)
     return models
 
@@ -177,9 +240,24 @@ def find_all_mmproj():
     return found
 
 
+def model_total_bytes(path: Path) -> int:
+    """Size of the model on disk; for split GGUFs, the sum of all shards."""
+    m = re.match(r"(.+)-\d{5}-of-(\d{5})\.gguf$", path.name, re.IGNORECASE)
+    if not m:
+        return path.stat().st_size
+    prefix, count = m.group(1), m.group(2)
+    shard_re = re.compile(re.escape(prefix) + r"-\d{5}-of-" + count + r"\.gguf$",
+                          re.IGNORECASE)
+    total = 0
+    for f in path.parent.iterdir():
+        if shard_re.match(f.name):
+            total += f.stat().st_size
+    return total
+
+
 def fmt_size(path: Path) -> str:
     try:
-        b = path.stat().st_size
+        b = model_total_bytes(path)
         for unit in ("B", "KB", "MB", "GB"):
             if b < 1024:
                 return f"{b:.0f}{unit}"
@@ -208,17 +286,50 @@ def _template_tokens(stem: str) -> set:
     return {t for t in norm.split() if t}
 
 
+# Explicit model-name -> template overrides, checked BEFORE the fuzzy matcher.
+# Each entry is (substring matched case-insensitively against the model
+# filename, template filename in TEMPLATES_DIR). Use this when the right
+# template does not share a name with the model, which the token scorer below
+# can never work out on its own.
+TEMPLATE_OVERRIDES = [
+    # Laguna S 2.1 (and derivatives like -CRACK) shipped with a template that
+    # stopped reasoning after turn 1. Poolside published a fixed one in
+    # poolside/Laguna-S-2.1-GGUF (chat_template.jinja): enable_thinking now
+    # defaults true, preserve_thinking is honoured, and the generation prompt
+    # ends on an open <think>. That is what Laguna-S-2.1.jinja holds. Pair it
+    # with reasoning_preserve=true so prior turns carry real reasoning_content
+    # instead of an empty <think></think>. Older GGUFs still embed the broken
+    # template, so keep this override until the quants are re-uploaded.
+    ("laguna", "Laguna-S-2.1.jinja"),
+]
+
+
+def find_template_override(model: Path):
+    """Return the explicitly mapped template for this model, or None."""
+    name = model.name.lower()
+    for needle, tpl_name in TEMPLATE_OVERRIDES:
+        if needle in name:
+            tpl = TEMPLATES_DIR / tpl_name
+            if tpl.exists():
+                return tpl
+    return None
+
+
 def find_template_for_model(model: Path):
     """
     Best-effort match of a local model file to a curated .jinja template in
     TEMPLATES_DIR by name. Returns the template Path or None.
 
-    Strategy: score each template by how many of its name tokens appear in the
-    model filename, requiring the model-family token (first alpha token) to
-    match. Returns the highest-scoring template above a small threshold.
+    Strategy: an explicit TEMPLATE_OVERRIDES hit wins outright; otherwise score
+    each template by how many of its name tokens appear in the model filename,
+    requiring the model-family token (first alpha token) to match. Returns the
+    highest-scoring template above a small threshold.
     """
     if not TEMPLATES_DIR.exists():
         return None
+    override = find_template_override(model)
+    if override is not None:
+        return override
     model_norm = _normalize(model.stem)
     model_tokens = _template_tokens(model.stem)
 
@@ -253,10 +364,93 @@ def find_template_for_model(model: Path):
     return best if best_score >= 2 else None
 
 
+# ── GGUF template inspection ──────────────────────────────────────────────────
+# Header-only read of the embedded jinja chat template, then a plain text scan
+# for the thinking-related kwargs the template reads (enable_thinking vs
+# reasoning_effort) and, when stated as a literal list, the values it accepts.
+# No jinja execution, so it cannot follow computed logic; unknown templates
+# just fall back to the full option list.
+
+_GGUF_VALUE_SIZES = {0: 1, 1: 1, 2: 2, 3: 2, 4: 4, 5: 4, 6: 4, 7: 1, 10: 8, 11: 8, 12: 8}
+
+
+def read_gguf_chat_template(model: Path):
+    """Return tokenizer.chat_template from a GGUF header, or None."""
+    try:
+        with open(model, "rb") as f:
+            def u32(): return int.from_bytes(f.read(4), "little")
+            def u64(): return int.from_bytes(f.read(8), "little")
+
+            def skip_value(vtype):
+                if vtype == 8:                       # string
+                    f.seek(u64(), 1)
+                elif vtype == 9:                     # array
+                    etype, n = u32(), u64()
+                    if etype == 8:
+                        for _ in range(n):
+                            f.seek(u64(), 1)
+                    elif etype == 9:
+                        for _ in range(n):
+                            skip_value(9)
+                    else:
+                        f.seek(_GGUF_VALUE_SIZES[etype] * n, 1)
+                else:
+                    f.seek(_GGUF_VALUE_SIZES[vtype], 1)
+
+            if f.read(4) != b"GGUF":
+                return None
+            u32()                                    # version
+            u64()                                    # tensor count
+            for _ in range(u64()):
+                key = f.read(u64()).decode("utf-8", "replace")
+                vtype = u32()
+                if key == "tokenizer.chat_template" and vtype == 8:
+                    return f.read(u64()).decode("utf-8", "replace")
+                skip_value(vtype)
+    except Exception:
+        return None
+    return None
+
+
+_template_info_cache = {}
+
+
+def template_reasoning_info(model: Path) -> dict:
+    """Which thinking switches the model's embedded template understands."""
+    key = str(model)
+    if key not in _template_info_cache:
+        tpl = read_gguf_chat_template(model)
+        info = {
+            "has_template":     tpl is not None,
+            "enable_thinking":  bool(tpl) and "enable_thinking" in tpl,
+            "reasoning_effort": bool(tpl) and "reasoning_effort" in tpl,
+            "effort_values":    None,
+        }
+        if info["reasoning_effort"]:
+            # e.g. {%- elif reasoning_effort not in ['high', 'low', 'no_think'] %}
+            m = re.search(r"reasoning_effort\s+(?:not\s+)?in\s*\[([^\]]*)\]", tpl)
+            if m:
+                vals = re.findall(r"""['"]([^'"]+)['"]""", m.group(1))
+                if vals:
+                    info["effort_values"] = vals
+        _template_info_cache[key] = info
+    return _template_info_cache[key]
+
+
 # ── Command builder ───────────────────────────────────────────────────────────
 
 def build_command(model: Path, cfg: dict) -> list:
-    cmd = [LLAMA_SERVER, "-m", str(model)]
+    server = LLAMA_SERVER
+    fix_args = []
+    fix = find_model_fix(model)
+    if fix:
+        cfg = {**cfg, **fix["overrides"]}
+        patched = fix.get("server")
+        if patched and Path(patched).exists():
+            server = patched
+        else:
+            fix_args = fix.get("fallback_args", [])
+    cmd = [server, "-m", str(model)]
     visual = cfg.get("visual_model")
     if visual == "none":
         pass  # explicitly disabled
@@ -314,16 +508,32 @@ def build_command(model: Path, cfg: dict) -> list:
     # Thinking is driven by --reasoning on/off (emitted above). The current
     # llama.cpp build reads it from the template's thinking flag; the older
     # --chat-template-kwargs '{"enable_thinking": ...}' path is now deprecated
-    # and warns at startup, so we no longer emit it.
+    # and warns at startup, so we no longer emit it. Templates that instead
+    # gate thinking on a reasoning_effort kwarg (Hunyuan V3, gpt-oss) ignore
+    # enable_thinking, so --reasoning on alone cannot enable thinking there;
+    # the reasoning_effort setting reaches them via --chat-template-kwargs.
+    if cfg.get("reasoning_effort") is not None:
+        cmd += ["--chat-template-kwargs",
+                json.dumps({"reasoning_effort": cfg["reasoning_effort"]})]
+    if cfg.get("reasoning_preserve") is True:
+        cmd += ["--reasoning-preserve"]
+    elif cfg.get("reasoning_preserve") is False:
+        cmd += ["--no-reasoning-preserve"]
     # Auto-match a curated chat template by model name. When auto_template is on,
     # find the best local .jinja for this model and pass it explicitly. Falls
-    # back to the embedded template.
+    # back to the embedded template. TEMPLATE_OVERRIDES entries are explicit
+    # per-model rules rather than guesses, so they apply even with auto_template
+    # off: those models are known-broken on their embedded template.
     matched_template = None
     if cfg.get("auto_template"):
         matched_template = find_template_for_model(model)
+    else:
+        matched_template = find_template_override(model)
     # A custom --chat-template-file is only honored on the Jinja code path
     # (jinja is on by default in current builds, but force it to be explicit).
+    # --chat-template-kwargs likewise only applies under Jinja.
     use_jinja = (cfg.get("jinja") or cfg.get("auto_template")
+                 or cfg.get("reasoning_effort") is not None
                  or matched_template is not None)
     if use_jinja:
         cmd += ["--jinja"]
@@ -333,6 +543,8 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2"]
     if cfg.get("repeat_penalty") is not None:
         cmd += ["--repeat-penalty", str(cfg["repeat_penalty"])]
+    if fix_args:
+        cmd += fix_args
     cmd += ["--parallel", "1"]
     #cmd += ["--no-warmup"]
     return cmd
@@ -412,15 +624,27 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
             parts.append(f"budget={cfg['thinking_budget']}")
         if cfg.get("reasoning_format") is not None:
             parts.append(f"rfmt={cfg['reasoning_format']}")
-        if cfg.get("jinja") or cfg.get("auto_template") or thinking is not None:
+        if cfg.get("reasoning_effort") is not None:
+            parts.append(f"reff={cfg['reasoning_effort']}")
+        if cfg.get("reasoning_preserve") is not None:
+            parts.append(f"preserve={'on' if cfg['reasoning_preserve'] else 'off'}")
+        if (cfg.get("jinja") or cfg.get("auto_template") or thinking is not None
+                or cfg.get("reasoning_effort") is not None):
             parts.append("jinja")
         if cfg.get("auto_template"):
             tpl = find_template_for_model(models[sel])
             parts.append(f"tpl={tpl.stem}" if tpl else "tpl=embedded")
+        else:
+            tpl = find_template_override(models[sel])
+            if tpl is not None:
+                parts.append(f"tpl={tpl.stem}*")
         if cfg.get("draft_mtp"):
             parts.append("mtp")
         if cfg.get("repeat_penalty") is not None:
             parts.append(f"rep={cfg['repeat_penalty']}")
+        fix = find_model_fix(models[sel])
+        if fix:
+            parts.append(f"FIX:{fix['name']}")
         settings_str = " " + "  ".join(parts) + vision_tag + saved_mark
     else:
         settings_str = " (no models)"
@@ -513,13 +737,33 @@ def inline_edit(stdscr, label, current_val):
 
 # ── Settings menu ─────────────────────────────────────────────────────────────
 
-def settings_menu(stdscr, cfg):
+def settings_menu(stdscr, cfg, model=None):
     # Build visual model options: None (auto), "none" (disabled), then all found mmproj files
     all_mmproj = find_all_mmproj()
     visual_options = [None, "none"] + [str(f) for f in all_mmproj]
     visual_labels = {None: "auto (same folder)", "none": "disabled"}
     for f in all_mmproj:
         visual_labels[str(f)] = f"{f.name}  ({f.parent})"
+
+    # Narrow reasoning_effort choices to what this model's embedded template
+    # actually reads, and build a hint line describing its thinking switches.
+    effort_options = REASONING_EFFORT_OPTIONS
+    tpl_hint = ""
+    if model is not None:
+        tinfo = template_reasoning_info(model)
+        if not tinfo["has_template"]:
+            tpl_hint = "no chat template embedded in GGUF"
+        elif tinfo["reasoning_effort"]:
+            vals = tinfo["effort_values"]
+            if vals:
+                effort_options = [None] + vals
+                tpl_hint = f"template thinking switch: reasoning_effort ({'/'.join(vals)})"
+            else:
+                tpl_hint = "template thinking switch: reasoning_effort (values not detected)"
+        elif tinfo["enable_thinking"]:
+            tpl_hint = "template thinking switch: enable_thinking (use Thinking on/off, leave effort default)"
+        else:
+            tpl_hint = "template has no thinking switch (always-on or non-thinking model)"
 
     fields = [
         ("context",      "Context length",     CONTEXT_OPTIONS),
@@ -540,6 +784,8 @@ def settings_menu(stdscr, cfg):
         ("thinking",         "Thinking (on/off)",       THINKING_OPTIONS),
         ("thinking_budget",  "Thinking budget (tokens)", THINKING_BUDGET_OPTIONS),
         ("reasoning_format", "Reasoning format",        REASONING_FORMAT_OPTIONS),
+        ("reasoning_effort", "Reasoning effort (kwarg)", effort_options),
+        ("reasoning_preserve", "Preserve reasoning history", REASONING_PRESERVE_OPTIONS),
         ("jinja",            "Jinja templates (--jinja)", [False, True]),
         ("auto_template",    "Auto-match chat template",  [False, True]),
         ("draft_mtp",      "Draft MTP (--draft-mtp)",  [False, True]),
@@ -559,7 +805,7 @@ def settings_menu(stdscr, cfg):
 
         for i, (key, label, options) in enumerate(fields):
             val = cfg.get(key)
-            if key == "thinking":
+            if key in ("thinking", "reasoning_preserve"):
                 display = {None: "default", True: "on", False: "off"}.get(val, str(val))
             elif key == "visual_model":
                 display = visual_labels.get(val, Path(val).name if val else "auto (same folder)")
@@ -573,6 +819,11 @@ def settings_menu(stdscr, cfg):
                 stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
             else:
                 stdscr.addstr(2 + i, 0, line[:w-1])
+
+        if tpl_hint and 3 + len(fields) < h:
+            stdscr.attron(curses.color_pair(6))
+            stdscr.addstr(3 + len(fields), 0, f"  {tpl_hint}"[:w-1])
+            stdscr.attroff(curses.color_pair(6))
 
         stdscr.refresh()
         key = stdscr.getch()
@@ -689,7 +940,7 @@ def main(stdscr):
 
         # ── Settings ──
         elif key in (ord('s'), ord('S')):
-            settings_menu(stdscr, cfg)
+            settings_menu(stdscr, cfg, models[sel])
             persist_cfg(models[sel], cfg, all_saved, is_launch=False)
             status = "Settings saved."
 
