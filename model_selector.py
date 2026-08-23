@@ -25,6 +25,9 @@ SETTINGS_FILE = Path(__file__).parent / "model_settings.json"
 # Web-search MCP server (SearXNG-backed); its own config file stays the
 # source of truth for the server definition.
 MCP_SEARCH_CONFIG = Path(r"C:\tools\search_mcp\mcp-config.json")
+# Godot 4.x engine control MCP server (node running the prebuilt bundle);
+# its Cursor-format config also carries the GODOT_PATH env for the server.
+MCP_GODOT_CONFIG  = Path(r"C:\tools\godot-mcp\godot-mcp.json")
 
 # ── MCP server registry ───────────────────────────────────────────────────────
 # Servers the MCP menu can toggle per model (cfg["mcp_enabled"] holds the
@@ -38,12 +41,22 @@ MCP_SEARCH_CONFIG = Path(r"C:\tools\search_mcp\mcp-config.json")
 MCP_DIR            = Path(r"C:\tools\mcp")
 MCP_HTTP_BRIDGE    = MCP_DIR / "mcp_http_bridge.py"
 PLAYWRIGHT_MCP_URL = "http://100.92.156.106:8931/mcp"
+# Blender MCP server (official Blender Lab bridge, installed as a uv tool
+# from projects.blender.org/lab/blender_mcp); it talks to the MCP add-on
+# running inside Blender on localhost:9876, so Blender must be open with the
+# add-on's server started for its tools to answer.
+BLENDER_MCP_EXE    = Path(r"C:\Users\weste\.local\bin\blender-mcp.exe")
 
 MCP_SERVERS = {
     "search": {
         "label": "Search (SearXNG)",
         "note":  "web_search via local search MCP",
         "config_file": MCP_SEARCH_CONFIG,
+    },
+    "godot": {
+        "label": "Godot (game engine)",
+        "note":  "157 godot/scene/script tools",
+        "config_file": MCP_GODOT_CONFIG,
     },
     "playwright": {
         "label": "Playwright (browser)",
@@ -53,6 +66,15 @@ MCP_SERVERS = {
         "definition": {
             "command": sys.executable,
             "args": [str(MCP_HTTP_BRIDGE), PLAYWRIGHT_MCP_URL],
+        },
+    },
+    "blender": {
+        "label": "Blender (3D)",
+        "note":  "26 tools, needs Blender open on :9876",
+        "requires": BLENDER_MCP_EXE,
+        "definition": {
+            "command": str(BLENDER_MCP_EXE),
+            "args": [],
         },
     },
 }
@@ -65,11 +87,9 @@ DEFAULTS = {
     "flash_attn":   True,
     "cache_type_k": "q8_0",
     "cache_type_v": "q8_0",
-    # Single unified KV buffer shared across all sequences (-kvu). The server
-    # only enables this on its own when the slot count is auto, and this
-    # launcher always passes --parallel 1, so pass the flag explicitly.
-    # True = --kv-unified, False = --no-kv-unified, None = flag omitted.
-    "kv_unified":   True,
+    # RAM cache size in MB for --cache-ram. Allows offloading the KV cache
+    # to system memory when it does not fit in VRAM. None = flag omitted.
+    "cache_ram":    16384,
     "verbosity":    3,
     "batch":        512,
     "ubatch":       None,
@@ -123,12 +143,31 @@ DEFAULTS = {
     # via --mcp-servers-json and force --jinja (MCP tool calls need the jinja
     # code path). Entries whose files are missing are skipped at launch.
     "mcp_enabled":      [],
-    "draft_mtp":        False,       # Enable Multi-Token Prediction speculative decoding
+    # Multi-Token Prediction speculative decoding (--spec-type draft-mtp).
+    # Needs VRAM HEADROOM: the server builds a second (draft) context against
+    # the target model, which cost ~0.9 GB extra on a 27B Q6_K here. When the
+    # context is already sized to the edge of VRAM, enabling MTP pushes weights
+    # out to the CPU and roughly HALVES throughput instead of raising it.
+    # Measured, Qwen3.8-27B-MTP Q6_K on a 32 GB 5090:
+    #   ctx 32k:  56.8 -> 92.7 tok/s  (fits, 1.6x faster)
+    #   ctx 134k: 40   -> 61   tok/s  (still fits, ~1 GB free, 1.5x faster)
+    #   ctx 196k: 56.4 -> 27.7 tok/s  (only ~0.9 GB free, spills to CPU)
+    # Acceptance is fine in all cases (~65%); it is purely a fit problem.
+    # Note the two effects are separate: the MTP SPEEDUP holds at ~1.5-1.6x
+    # wherever the draft context fits, but the BASELINE itself falls as the KV
+    # cache grows (57 -> 40 tok/s from 32k to 134k), so a large context costs
+    # throughput even when MTP is working perfectly. 196k is past the fit edge.
+    "draft_mtp":        False,
+    # Tokens drafted per step (--spec-draft-n-max). None = server default (3).
+    # 2 and 3 measured within noise of each other; lower it only if acceptance
+    # is poor, raise it if acceptance is very high.
+    "draft_n_max":      None,
     # Path to an external draft/MTP module GGUF, passed as --spec-draft-model.
-    # Needed when the MTP heads are NOT embedded in the main model, e.g. the
-    # gemma4-assistant drafter files that ship as a separate GGUF next to the
-    # main quant. Models with embedded MTP ("Native-MTP-Preserved" quants)
-    # leave this None; draft-mtp then uses the main model's own MTP layers.
+    # NOT needed for most MTP models: if the GGUF carries its own nextn/MTP
+    # tensors (e.g. Qwen3.8-27B-MTP, "Native-MTP-Preserved" quants), draft-mtp
+    # runs off those and the server logs "creating MTP draft context against
+    # the target model". Only set this when the MTP heads ship as a SEPARATE
+    # GGUF next to the main quant, like the gemma4-assistant drafter files.
     "draft_model":      None,
     "visual_model":     "none",     # None=auto (same folder), "none"=disabled, or path to mmproj
 }
@@ -137,8 +176,8 @@ CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000,
 THREAD_OPTIONS   = [4, 8, 12, 16, 20, 24, 32]
 CACHE_OPTIONS    = [None, "f16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"]
 BATCH_OPTIONS    = [None, 256, 512, 1024, 2048, 4096]
+CACHE_RAM_OPTIONS = [None, 4096, 8192, 16384, 32768, 49152, 65536, 131072]
 LOAD_MODE_OPTIONS = [None, "none", "mmap", "mlock", "mmap+mlock", "dio"]
-KV_UNIFIED_OPTIONS = [None, True, False]  # None=server default
 TEMP_OPTIONS     = [None, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0, 1.2, 1.5]
 TOP_P_OPTIONS    = [None, 0.1, 0.5, 0.8, 0.9, 0.95, 1.0]
 TOP_K_OPTIONS    = [None, 0, 10, 20, 40, 80, 100]
@@ -153,15 +192,17 @@ REASONING_FORMAT_OPTIONS = [None, "deepseek", "deepseek-legacy", "none"]
 # values the selected model's embedded template actually accepts.
 REASONING_EFFORT_OPTIONS = [None, "no_think", "low", "medium", "high", "xhigh", "max"]
 REASONING_PRESERVE_OPTIONS = [None, True, False]  # None=template default
+DRAFT_N_MAX_OPTIONS      = [None, 1, 2, 3, 4, 5, 6, 8]  # None = server default (3)
 REPEAT_PENALTY_OPTIONS   = [None, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3, 1.5]
 PRESENCE_PENALTY_OPTIONS = [None, 0.0, 0.1, 0.3, 0.5, 0.8, 1.0, 1.2, 1.5, 1.8, 2.0]
 
 # Fields that support direct text entry for precision
 # (draft_model is free-form text: a file path, not a number)
 EDITABLE_FIELDS = {"context", "temp", "top_p", "top_k", "min_p",
-                   "repeat_penalty", "presence_penalty", "draft_model"}
+                   "repeat_penalty", "presence_penalty", "draft_model",
+                   "cache_ram"}
 # Editable fields parsed as whole numbers rather than floats
-INT_EDITABLE_FIELDS = {"context", "top_k"}
+INT_EDITABLE_FIELDS = {"context", "top_k", "cache_ram"}
 
 
 # ── Hard-coded per-model fixes ────────────────────────────────────────────────
@@ -224,7 +265,8 @@ def _migrate_settings(data: dict) -> dict:
     """Retired-key fixups in place:
     gemma4_template_fix -> auto_template,
     no_mmap/mlock -> load_mode (old defaults no_mmap=True, mlock=True
-    equal the new "mlock" mode)."""
+    equal the new "mlock" mode),
+    kv_unified removed (always enabled)."""
     for key, val in data.items():
         if key == "__meta__" or not isinstance(val, dict):
             continue
@@ -232,6 +274,7 @@ def _migrate_settings(data: dict) -> dict:
             val["auto_template"] = val.pop("gemma4_template_fix")
         if "live_search" in val:
             val["mcp_enabled"] = ["search"] if val.pop("live_search") else []
+        val.pop("kv_unified", None)
         if "no_mmap" in val or "mlock" in val:
             no_mmap = val.pop("no_mmap", True)
             mlock   = val.pop("mlock", True)
@@ -537,8 +580,13 @@ def template_reasoning_info(model: Path) -> dict:
             "effort_values":    None,
         }
         if info["reasoning_effort"]:
-            # e.g. {%- elif reasoning_effort not in ['high', 'low', 'no_think'] %}
-            m = re.search(r"reasoning_effort\s+(?:not\s+)?in\s*\[([^\]]*)\]", tpl)
+            # Lists, tuples and sets all appear in the wild:
+            #   {%- elif reasoning_effort not in ['high', 'low', 'no_think'] %}
+            #   {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}
+            # Picking the wrong values here is not cosmetic: an effort value the
+            # template rejects makes it raise, and every request 500s.
+            m = re.search(r"reasoning_effort\s+(?:not\s+)?in\s*"
+                          r"[\[({]([^\])}]*)[\])}]", tpl)
             if m:
                 vals = re.findall(r"""['"]([^'"]+)['"]""", m.group(1))
                 if vals:
@@ -612,10 +660,9 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["-ctk", cfg["cache_type_k"]]
     if cfg.get("cache_type_v"):
         cmd += ["-ctv", cfg["cache_type_v"]]
-    if cfg.get("kv_unified") is True:
-        cmd += ["--kv-unified"]
-    elif cfg.get("kv_unified") is False:
-        cmd += ["--no-kv-unified"]
+    if cfg.get("cache_ram") is not None:
+        cmd += ["--cache-ram", str(cfg["cache_ram"])]
+    cmd += ["--kv-unified"]
     if cfg.get("verbosity") is not None:
         cmd += ["--verbosity", str(cfg["verbosity"])]
     if cfg.get("batch"):
@@ -689,7 +736,11 @@ def build_command(model: Path, cfg: dict) -> list:
         # explicitly keeps the same security posture and silences the warning.
         cmd += ["--cors-origins", "localhost"]
     if cfg.get("draft_mtp"):
-        cmd += ["--spec-type", "draft-mtp", "--spec-draft-n-max", "2"]
+        cmd += ["--spec-type", "draft-mtp"]
+        if cfg.get("draft_n_max") is not None:
+            cmd += ["--spec-draft-n-max", str(cfg["draft_n_max"])]
+        # Only for models whose MTP heads live in a separate GGUF; embedded-MTP
+        # models draft from their own nextn layers with no extra file.
         draft = cfg.get("draft_model")
         if draft and Path(draft).exists():
             cmd += ["--spec-draft-model", str(draft)]
@@ -699,7 +750,7 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--presence-penalty", str(cfg["presence_penalty"])]
     if fix_args:
         cmd += fix_args
-    cmd += ["--parallel", "1"]
+    cmd += ["--parallel", "4"]
     #cmd += ["--no-warmup"]
     return cmd
 
@@ -731,7 +782,7 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
     # Header
     header = (
         " llama.cpp Model Selector  |  "
-        "arrows=navigate  enter=launch  s=settings  "
+        "arrows=navigate  enter=launch  s=settings  c=copy-settings  "
         "/=search  o=sort  d=del-settings  r=rescan  q=quit"
     )
     stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
@@ -762,12 +813,11 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
             f"ctk={ctk}",
             f"ctv={ctv}",
         ]
-        if cfg.get("kv_unified") is not None:
-            parts.append(f"kvu={'on' if cfg['kv_unified'] else 'off'}")
         if verb is not None:  parts.append(f"verb={verb}")
         if bat  is not None:  parts.append(f"b={bat}")
         if ubat is not None:  parts.append(f"ub={ubat}")
         if cfg.get("load_mode"): parts.append(f"load={cfg['load_mode']}")
+        if cfg.get("cache_ram") is not None: parts.append(f"cram={cfg['cache_ram']}")
         if cfg.get("temp")  is not None: parts.append(f"temp={cfg['temp']}")
         if cfg.get("top_p") is not None: parts.append(f"top_p={cfg['top_p']}")
         if cfg.get("top_k") is not None: parts.append(f"top_k={cfg['top_k']}")
@@ -797,7 +847,9 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
             parts.append("mcp=" + ",".join(cfg["mcp_enabled"]))
         if cfg.get("draft_mtp"):
             dm = cfg.get("draft_model")
-            parts.append(f"mtp:{Path(dm).name}" if dm else "mtp")
+            nmax = cfg.get("draft_n_max")
+            tag = f"mtp:{Path(dm).name}" if dm else "mtp"
+            parts.append(f"{tag}(n={nmax})" if nmax is not None else tag)
         if cfg.get("repeat_penalty") is not None:
             parts.append(f"rep={cfg['repeat_penalty']}")
         if cfg.get("presence_penalty") is not None:
@@ -960,9 +1012,153 @@ def mcp_menu(stdscr, cfg):
             cfg["mcp_enabled"] = [n for n in names if n in current]
 
 
+# ── Copy settings from another model ──────────────────────────────────────────
+# Settings that name a file inside the SOURCE model's own folder. Copying them
+# onto another model would point it at the wrong file, so they are left alone
+# unless the user asks for them explicitly (p toggle).
+PATH_BOUND_KEYS = {"visual_model", "draft_model"}
+
+
+def saved_models(all_saved: dict, exclude: Path = None):
+    """Models that have saved settings, most recently launched first."""
+    keys = [k for k in all_saved if k != "__meta__"]
+    if exclude is not None:
+        keys = [k for k in keys if k != str(exclude)]
+    keys.sort(key=lambda k: (-all_saved.get("__meta__", {})
+                             .get(k, {}).get("last_launch", 0), k.lower()))
+    return [Path(k) for k in keys]
+
+
+def fmt_value(key, val):
+    if key in ("thinking", "reasoning_preserve", "flash_attn",
+               "jinja", "auto_template", "draft_mtp"):
+        return {None: "default", True: "on", False: "off"}.get(val, str(val))
+    if key == "mcp_enabled":
+        return ", ".join(val) if val else "none"
+    if key in PATH_BOUND_KEYS:
+        if val is None:
+            return "auto" if key == "visual_model" else "none"
+        if val == "none":
+            return "disabled"
+        return Path(val).name
+    return str(val) if val is not None else "default"
+
+
+def copy_payload(src_cfg: dict, include_paths: bool) -> dict:
+    """The settings that a copy would apply (host is env-managed, never copied)."""
+    skip = {"host"} if include_paths else {"host"} | PATH_BOUND_KEYS
+    return {k: (list(v) if isinstance(v, list) else v)
+            for k, v in src_cfg.items() if k not in skip}
+
+
+def copy_settings_menu(stdscr, cfg, target: Path, all_saved: dict):
+    """Pick another model and copy its settings onto the current one.
+
+    Returns (copied, status message). The full resolved config of the source is
+    applied (defaults included), so the target ends up matching the source
+    rather than merging with whatever it had before.
+    """
+    sources = saved_models(all_saved, exclude=target)
+    if not sources:
+        return False, "No other model has saved settings to copy from."
+
+    base_dirs = [Path(d) for d in MODEL_DIRS]
+    include_paths = False
+    filter_str = ""
+    sel = 0
+
+    while True:
+        shown = [m for m in sources
+                 if not filter_str or filter_str.lower() in str(m).lower()]
+        sel = max(0, min(sel, len(shown) - 1))
+
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
+        stdscr.addstr(0, 0,
+            " Copy settings from another model  |  up/down=pick  enter=copy  "
+            "type=filter  tab=include file paths  Esc=cancel".ljust(w-1))
+        stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
+
+        stdscr.attron(curses.color_pair(3))
+        stdscr.addstr(1, 0, f" Onto: {short_label(target, base_dirs)}"[:w-1])
+        stdscr.attroff(curses.color_pair(3))
+        stdscr.attron(curses.color_pair(6))
+        stdscr.addstr(2, 0,
+            (f" Filter: {filter_str}_   {len(shown)} models with saved settings"
+             f"   [file paths (mmproj/draft): "
+             f"{'copied too' if include_paths else 'kept as-is'}]")[:w-1])
+        stdscr.attroff(curses.color_pair(6))
+
+        list_w = max(30, min(70, w // 2 - 2))
+        list_h = h - 5
+        offset = max(0, sel - list_h + 1) if sel >= list_h else 0
+
+        for i, m in enumerate(shown[offset:offset + list_h]):
+            idx = i + offset
+            line = f" {short_label(m, base_dirs)}"[:list_w].ljust(list_w)
+            if idx == sel:
+                stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
+                stdscr.addstr(4 + i, 0, line)
+                stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
+            else:
+                stdscr.addstr(4 + i, 0, line)
+
+        # Preview: what would change on the target
+        if shown:
+            src_cfg = cfg_for_model(shown[sel], all_saved)
+            payload = copy_payload(src_cfg, include_paths)
+            changes = [(k, cfg.get(k), v) for k, v in payload.items()
+                       if v != cfg.get(k)]
+            px = list_w + 3
+            pw = max(10, w - px - 1)
+            if not changes:
+                stdscr.attron(curses.color_pair(5))
+                stdscr.addstr(4, px, "Identical — nothing would change."[:pw])
+                stdscr.attroff(curses.color_pair(5))
+            else:
+                stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
+                stdscr.addstr(3, px, f"{len(changes)} setting(s) would change:"[:pw])
+                stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
+                for i, (k, old, new) in enumerate(changes[:h - 6]):
+                    txt = f"  {k:<20} {fmt_value(k, old)}  ->  {fmt_value(k, new)}"
+                    stdscr.addstr(4 + i, px, txt[:pw])
+
+        stdscr.refresh()
+        key = stdscr.getch()
+
+        if key == 27:                                   # Esc — cancel
+            return False, "Copy cancelled."
+        elif key == curses.KEY_UP:
+            sel = (sel - 1) % len(shown) if shown else 0
+        elif key == curses.KEY_DOWN:
+            sel = (sel + 1) % len(shown) if shown else 0
+        elif key == curses.KEY_PPAGE:
+            sel = max(0, sel - 10)
+        elif key == curses.KEY_NPAGE:
+            sel = min(len(shown) - 1, sel + 10) if shown else 0
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            filter_str = filter_str[:-1]
+            sel = 0
+        elif key in (10, 13, curses.KEY_ENTER):
+            if not shown:
+                continue
+            src = shown[sel]
+            payload = copy_payload(cfg_for_model(src, all_saved), include_paths)
+            changed = sum(1 for k, v in payload.items() if v != cfg.get(k))
+            cfg.update(payload)
+            return True, (f"Copied {changed} setting(s) from "
+                          f"{short_label(src, base_dirs)}.")
+        elif key == 9:                                  # Tab — path keys on/off
+            include_paths = not include_paths
+        elif 32 <= key <= 126:
+            filter_str += chr(key)
+            sel = 0
+
+
 # ── Settings menu ─────────────────────────────────────────────────────────────
 
-def settings_menu(stdscr, cfg, model=None):
+def settings_menu(stdscr, cfg, model=None, all_saved=None):
     # Build visual model options: None (auto), "none" (disabled), then all found mmproj files
     all_mmproj = find_all_mmproj()
     visual_options = [None, "none"] + [str(f) for f in all_mmproj]
@@ -991,6 +1187,7 @@ def settings_menu(stdscr, cfg, model=None):
             tpl_hint = "template has no thinking switch (always-on or non-thinking model)"
 
     main_fields = [
+        ("__copy__",     "Copy from other model",     None),
         ("context",      "Context length",     CONTEXT_OPTIONS),
         ("cache_type_k", "Cache K (-ctk)",     CACHE_OPTIONS),
         ("cache_type_v", "Cache V (-ctv)",     CACHE_OPTIONS),
@@ -1010,7 +1207,7 @@ def settings_menu(stdscr, cfg, model=None):
         ("threads",      "Threads",            THREAD_OPTIONS),
         ("port",         "Port",               None),
         ("flash_attn",   "Flash attention",    [True, False]),
-        ("kv_unified",   "Unified KV cache (-kvu)", KV_UNIFIED_OPTIONS),
+        ("cache_ram",    "Cache RAM MB (--cache-ram)", CACHE_RAM_OPTIONS),
         ("batch",        "Batch size (-b)",    BATCH_OPTIONS),
         ("ubatch",       "Micro-batch (-ub)",  BATCH_OPTIONS),
         ("load_mode",      "Load mode (--load-mode)", LOAD_MODE_OPTIONS),
@@ -1020,13 +1217,15 @@ def settings_menu(stdscr, cfg, model=None):
         ("reasoning_format", "Reasoning format",        REASONING_FORMAT_OPTIONS),
         ("thinking_budget",  "Thinking budget (tokens)", THINKING_BUDGET_OPTIONS),
         ("thinking",         "Thinking (on/off)",       THINKING_OPTIONS),
-        ("draft_mtp",      "Draft MTP (--draft-mtp)",  [False, True]),
-        ("draft_model",    "Draft model file (-md)",   None),
+        ("draft_mtp",      "Draft MTP (--spec-type)",  [False, True]),
+        ("draft_n_max",    "MTP draft tokens (n-max)", DRAFT_N_MAX_OPTIONS),
+        ("draft_model",    "Draft GGUF (-md, optional)", None),
         ("visual_model",   "Visual model (mmproj)",    visual_options),
     ]
     tabs = [("Main", main_fields), ("Advanced", advanced_fields)]
     tab = 0
     sel = 0
+    menu_status = ""
 
     while True:
         fields = tabs[tab][1]
@@ -1054,10 +1253,12 @@ def settings_menu(stdscr, cfg, model=None):
 
         for i, (key, label, options) in enumerate(fields):
             val = cfg.get(key)
-            if key in ("thinking", "reasoning_preserve", "kv_unified"):
+            if key in ("thinking", "reasoning_preserve"):
                 display = {None: "default", True: "on", False: "off"}.get(val, str(val))
             elif key == "__mcp__":
                 display = ", ".join(cfg.get("mcp_enabled") or []) or "none"
+            elif key == "__copy__":
+                display = "enter = pick a model to copy its settings from"
             elif key == "draft_model":
                 display = Path(val).name if val else "none"
             elif key == "visual_model":
@@ -1066,8 +1267,8 @@ def settings_menu(stdscr, cfg, model=None):
                 display = str(val) if val is not None else "default"
             if key in EDITABLE_FIELDS:
                 editable_marker = "[*]"
-            elif key == "__mcp__":
-                editable_marker = "[>]"   # enter opens the MCP submenu
+            elif key in ("__mcp__", "__copy__"):
+                editable_marker = "[>]"   # enter opens a submenu
             else:
                 editable_marker = "   "
             line = f"  {editable_marker} {label:<26} {display}"
@@ -1082,6 +1283,11 @@ def settings_menu(stdscr, cfg, model=None):
             stdscr.attron(curses.color_pair(6))
             stdscr.addstr(4 + len(fields), 0, f"  {tpl_hint}"[:w-1])
             stdscr.attroff(curses.color_pair(6))
+
+        if menu_status:
+            stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
+            stdscr.addstr(h - 1, 0, f" {menu_status}"[:w-1].ljust(w-1))
+            stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
 
         stdscr.refresh()
         key = stdscr.getch()
@@ -1098,6 +1304,12 @@ def settings_menu(stdscr, cfg, model=None):
             fkey, flabel, _ = fields[sel]
             if fkey == "__mcp__":
                 mcp_menu(stdscr, cfg)
+                continue
+            if fkey == "__copy__":
+                if all_saved is None or model is None:
+                    menu_status = "Copy unavailable here."
+                else:
+                    _, menu_status = copy_settings_menu(stdscr, cfg, model, all_saved)
                 continue
             if fkey in EDITABLE_FIELDS:
                 raw = inline_edit(stdscr, flabel, cfg.get(fkey))
@@ -1210,9 +1422,17 @@ def main(stdscr):
 
         # ── Settings ──
         elif key in (ord('s'), ord('S')):
-            settings_menu(stdscr, cfg, models[sel])
+            settings_menu(stdscr, cfg, models[sel], all_saved)
             persist_cfg(models[sel], cfg, all_saved, is_launch=False)
             status = "Settings saved."
+
+        # ── Copy settings from another model ──
+        elif key in (ord('c'), ord('C')):
+            if models:
+                copied, status = copy_settings_menu(stdscr, cfg, models[sel], all_saved)
+                if copied:
+                    persist_cfg(models[sel], cfg, all_saved, is_launch=False)
+                    status += " Saved."
 
         # ── Delete saved settings ──
         elif key in (ord('d'), ord('D')):
