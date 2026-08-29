@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 r"""
 llama.cpp model selector - keyboard-driven TUI
-Scans C:\llm and E:\llm recursively for GGUF files, detects mmproj (vision),
-and launches llama-server with appropriate settings.
+Scans the configured model directories recursively for GGUF files, detects
+mmproj (vision), and launches llama-server with appropriate settings.
 Per-model settings are saved to model_settings.json next to this script.
 """
 
@@ -22,41 +22,84 @@ LLAMA_SERVER = r"C:\tools\llamacpp\llama-server.exe"
 MODEL_DIRS   = [r"C:\llm", r"E:\llm", r"K:\models", r"M:\models"]
 TEMPLATES_DIR = Path(r"C:\tools\llamacpp\templates")
 SETTINGS_FILE = Path(__file__).parent / "model_settings.json"
-# Web-search MCP server (SearXNG-backed); its own config file stays the
-# source of truth for the server definition.
-MCP_SEARCH_CONFIG = Path(r"C:\tools\search_mcp\mcp-config.json")
-# Godot 4.x engine control MCP server (node running the prebuilt bundle);
-# its Cursor-format config also carries the GODOT_PATH env for the server.
-MCP_GODOT_CONFIG  = Path(r"C:\tools\godot-mcp\godot-mcp.json")
 
 # ── MCP server registry ───────────────────────────────────────────────────────
 # Servers the MCP menu can toggle per model (cfg["mcp_enabled"] holds the
-# enabled names). An entry either points at a Cursor-format config_file whose
-# mcpServers definitions are merged in, or carries an inline definition.
+# enabled names). Every server is vendored into its own folder under mcp/ next
+# to this script and every path below is derived from MCP_DIR, so the launcher
+# is self-contained: move or copy the whole directory and the servers move with
+# it. Nothing outside this folder is needed except node (for godot) and the
+# base Python installs the two vendored venvs were created from.
+#   mcp/search       SearXNG-backed web search, runs from mcp/search/.venv
+#   mcp/godot        node bundle + the Godot console build it drives
+#   mcp/playwright   browser automation, reached over streamable-HTTP via
+#                    mcp/http_bridge (the bridge is not a server itself)
+#   mcp/blender      blender-mcp package in its own venv (python -m blmcp)
+#   mcp/unreal581    configs only - the server lives inside UnrealEditor
+# An entry either points at a Cursor-format config_file whose mcpServers
+# definitions are merged in, or carries an inline definition (used for all
+# four here, so no absolute path is baked into a config file on disk).
 # Remote streamable-HTTP servers go through mcp_http_bridge.py, because this
 # llama-server build only speaks MCP over stdio: the bridge is spawned by
 # llama-server itself and relays NDJSON <-> HTTP (it opens its own console
 # window for logs; closing that window disconnects just that server).
-# Adding a server = one dict entry here.
-MCP_DIR            = Path(r"C:\tools\mcp")
-MCP_HTTP_BRIDGE    = MCP_DIR / "mcp_http_bridge.py"
+# Adding a server = drop it in mcp/<name>/ and add one dict entry here.
+MCP_DIR = Path(__file__).parent / "mcp"
+
+# Web-search MCP server (SearXNG-backed), with its own virtualenv.
+MCP_SEARCH_PYTHON  = MCP_DIR / "search" / ".venv" / "Scripts" / "python.exe"
+MCP_SEARCH_SERVER  = MCP_DIR / "search" / "server.py"
+
+# Godot 4.x engine control MCP server (node running the prebuilt bundle).
+# GODOT_PATH points the server at the Godot console build shipped alongside it.
+MCP_GODOT_ENTRY    = MCP_DIR / "godot" / "server-new" / "build" / "index.js"
+MCP_GODOT_EXE      = MCP_DIR / "godot" / "Godot_v4.7.2-stable_win64_console.exe"
+
+MCP_HTTP_BRIDGE    = MCP_DIR / "http_bridge" / "mcp_http_bridge.py"
 PLAYWRIGHT_MCP_URL = "http://100.92.156.106:8931/mcp"
-# Blender MCP server (official Blender Lab bridge, installed as a uv tool
-# from projects.blender.org/lab/blender_mcp); it talks to the MCP add-on
-# running inside Blender on localhost:9876, so Blender must be open with the
-# add-on's server started for its tools to answer.
-BLENDER_MCP_EXE    = Path(r"C:\Users\weste\.local\bin\blender-mcp.exe")
+
+# Playwright browser-automation MCP server, reached over streamable-HTTP.
+# llama-server only speaks MCP over stdio, so the http_bridge relays between
+# stdio (server-side) and the remote HTTP endpoint.
+
+# Blender MCP server (official Blender Lab bridge from
+# projects.blender.org/lab/blender_mcp, installed into mcp/blender/venv and
+# launched as `python -m blmcp`); it talks to the MCP add-on running inside
+# Blender on localhost:9876, so Blender must be open with the add-on's server
+# started for its tools to answer.
+MCP_BLENDER_PYTHON = MCP_DIR / "blender" / "venv" / "Scripts" / "python.exe"
+
+# Unreal Engine 5.8's built-in MCP server (Engine/Plugins/Experimental/
+# ModelContextProtocol, experimental). Nothing is vendored: the server is
+# hosted by the UnrealEditor process itself, so it answers only while the
+# editor is open with the "Unreal MCP" and "All Toolsets" plugins enabled and
+# the server started (Editor Preferences -> Model Context Protocol, or the
+# console command ModelContextProtocol.StartServer 8000). It speaks
+# streamable-HTTP on localhost, so it goes through the same http_bridge as
+# playwright. mcp/unreal581 holds the ready-made client configs and setup
+# notes; keep the port here in sync with the ones in that folder.
+UNREAL_MCP_URL     = "http://127.0.0.1:8000/mcp"
 
 MCP_SERVERS = {
     "search": {
         "label": "Search (SearXNG)",
         "note":  "web_search via local search MCP",
-        "config_file": MCP_SEARCH_CONFIG,
+        "requires": MCP_SEARCH_PYTHON,
+        "definition": {
+            "command": str(MCP_SEARCH_PYTHON),
+            "args": [str(MCP_SEARCH_SERVER)],
+        },
     },
     "godot": {
         "label": "Godot (game engine)",
         "note":  "157 godot/scene/script tools",
-        "config_file": MCP_GODOT_CONFIG,
+        "requires": MCP_GODOT_ENTRY,
+        "definition": {
+            "type": "stdio",
+            "command": "node",
+            "args": [str(MCP_GODOT_ENTRY)],
+            "env": {"GODOT_PATH": str(MCP_GODOT_EXE)},
+        },
     },
     "playwright": {
         "label": "Playwright (browser)",
@@ -71,10 +114,20 @@ MCP_SERVERS = {
     "blender": {
         "label": "Blender (3D)",
         "note":  "26 tools, needs Blender open on :9876",
-        "requires": BLENDER_MCP_EXE,
+        "requires": MCP_BLENDER_PYTHON,
         "definition": {
-            "command": str(BLENDER_MCP_EXE),
-            "args": [],
+            "command": str(MCP_BLENDER_PYTHON),
+            "args": ["-m", "blmcp"],
+        },
+    },
+    "unreal581": {
+        "label": "Unreal Engine 5.8",
+        "note":  "needs UE 5.8 editor open, MCP server on :8000",
+        "endpoint": UNREAL_MCP_URL,
+        "requires": MCP_HTTP_BRIDGE,
+        "definition": {
+            "command": sys.executable,
+            "args": [str(MCP_HTTP_BRIDGE), UNREAL_MCP_URL],
         },
     },
 }
@@ -91,6 +144,56 @@ DEFAULTS = {
     # to system memory when it does not fit in VRAM. None = flag omitted.
     "cache_ram":    16384,
     "verbosity":    3,
+    # --kv-unified: one shared KV cache for every sequence instead of one slab
+    # per --parallel slot. On True the whole -c context is available to a single
+    # request; on False the server splits it into `parallel` equal shares, so
+    # -c 80000 --parallel 4 gives each request only 20000. True = flag emitted,
+    # False = flag omitted (server default). Note that architectures doing
+    # cache-order-dependent work can care: PR #27752's glm5next indexer pools
+    # mix cells across sequences under a unified cache. Not an issue at
+    # parallel=1, where there is only one sequence either way.
+    "kv_unified":   True,
+    # -ot / --override-tensor: force individual tensors onto a chosen device by
+    # regex, overriding whatever -ngl decided for them. Format is
+    # <name-regex>=<device>, device being CPU, CUDA0, CUDA1, ...; several rules
+    # are separated by commas.
+    #
+    # ###  READ THIS BEFORE SETTING IT  ###
+    #
+    # Setting this DISABLES llama.cpp's automatic VRAM fitter. The startup log
+    # says so out loud:
+    #
+    #   W common_fit_params: failed to fit params to free device memory:
+    #       model_params::tensor_buft_overrides already set by user, abort
+    #
+    # Normally common_fit_params measures free VRAM and works out which layers
+    # to offload. That pass is doing the heavy lifting on any model bigger than
+    # the card. As soon as ANY tensor override exists it gives up and obeys the
+    # literal flags instead - and the literal flag here is -ngl -1, "all layers
+    # on the GPU". On a model that does not fit, that means constant thrashing.
+    # Measured on Qwen3.8-Flash-Next, 32 GB card: 21 tok/s with this unset,
+    # 0.38 tok/s with just the per_layer_token_embd rule set. Sixty times slower.
+    #
+    # --n-cpu-moe had the same effect - it is implemented as tensor overrides
+    # internally, so setting it also switched the auto-fitter off, and on
+    # GLM-5.3-Flash that produced <0.1 tok/s. That flag is no longer emitted by
+    # this launcher at all; -ot is the only remaining way to override placement.
+    #
+    # So: leave this at default unless the auto-fitter is demonstrably doing
+    # something dumb. If you do set it, you own the whole placement decision -
+    # tune the rules by hand while watching these log lines:
+    #     load_tensors: CUDA0 model buffer size = ..... MiB
+    #     load_tensors:   CPU model buffer size = ..... MiB
+    #
+    # None = flag omitted; llama.cpp's auto-fitter places every tensor. This is
+    # almost always what you want.
+    "override_tensor": None,
+    # --parallel: concurrent request slots. 1 = strictly one request at a time,
+    # which is what a single interactive client wants: no context is reserved
+    # for slots nobody is using, and the model never time-slices between two
+    # generations. Raise it only when several clients really do hit the server
+    # at once. None = flag omitted (server default 1).
+    "parallel":     1,
     "batch":        512,
     "ubatch":       None,
     # Model loading mode. Replaces the deprecated --no-mmap / --mlock flags.
@@ -144,23 +247,22 @@ DEFAULTS = {
     # code path). Entries whose files are missing are skipped at launch.
     "mcp_enabled":      [],
     # Multi-Token Prediction speculative decoding (--spec-type draft-mtp).
-    # Needs VRAM HEADROOM: the server builds a second (draft) context against
-    # the target model, which cost ~0.9 GB extra on a 27B Q6_K here. When the
-    # context is already sized to the edge of VRAM, enabling MTP pushes weights
-    # out to the CPU and roughly HALVES throughput instead of raising it.
-    # Measured, Qwen3.8-27B-MTP Q6_K on a 32 GB 5090:
-    #   ctx 32k:  56.8 -> 92.7 tok/s  (fits, 1.6x faster)
-    #   ctx 134k: 40   -> 61   tok/s  (still fits, ~1 GB free, 1.5x faster)
-    #   ctx 196k: 56.4 -> 27.7 tok/s  (only ~0.9 GB free, spills to CPU)
-    # Acceptance is fine in all cases (~65%); it is purely a fit problem.
-    # Note the two effects are separate: the MTP SPEEDUP holds at ~1.5-1.6x
-    # wherever the draft context fits, but the BASELINE itself falls as the KV
-    # cache grows (57 -> 40 tok/s from 32k to 134k), so a large context costs
-    # throughput even when MTP is working perfectly. 196k is past the fit edge.
+    # Two independent ways this loses instead of wins, both showing up as a
+    # roughly halved token rate, so check which one before blaming the flag:
+    #   FIT      - the server builds a second (draft) context against the
+    #              target model (~1 GB on a 27B). With the main context
+    #              already at the edge of VRAM this pushes weights to the CPU.
+    #              Symptom: near-zero free VRAM, acceptance still fine.
+    #   DRAFTING - low-bit quants quantize the embedded nextn heads too, so
+    #              they draft badly, and on Gated Delta Net layers a rejected
+    #              draft costs a recurrent-state rollback rather than a cheap
+    #              KV drop. Symptom: VRAM headroom is fine, acceptance poor.
+    #              A separate higher-precision drafter GGUF (draft_model) can
+    #              win where the same model's embedded heads lose.
     "draft_mtp":        False,
     # Tokens drafted per step (--spec-draft-n-max). None = server default (3).
-    # 2 and 3 measured within noise of each other; lower it only if acceptance
-    # is poor, raise it if acceptance is very high.
+    # Lower it when acceptance is poor (less wasted work per rejection), raise
+    # it when acceptance is very high.
     "draft_n_max":      None,
     # Path to an external draft/MTP module GGUF, passed as --spec-draft-model.
     # NOT needed for most MTP models: if the GGUF carries its own nextn/MTP
@@ -176,7 +278,19 @@ CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000,
 THREAD_OPTIONS   = [4, 8, 12, 16, 20, 24, 32]
 CACHE_OPTIONS    = [None, "f16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"]
 BATCH_OPTIONS    = [None, 256, 512, 1024, 2048, 4096]
-CACHE_RAM_OPTIONS = [None, 4096, 8192, 16384, 32768, 49152, 65536, 131072]
+CACHE_RAM_OPTIONS = [None, 0, 4096, 8192, 16384, 32768, 49152, 65536, 131072]
+KV_UNIFIED_OPTIONS = [True, False]
+PARALLEL_OPTIONS   = [None, 1, 2, 3, 4, 6, 8, 16]
+# Presets for -ot. Free-text editable too, so anything else can be typed in.
+# WARNING: any value other than None turns off llama.cpp's automatic VRAM
+# fitter and makes -ngl -1 literal, which is catastrophically slow on a model
+# bigger than the card. Read the "override_tensor" comment in DEFAULTS before
+# touching this.
+OVERRIDE_TENSOR_OPTIONS = [
+    None,
+    r"per_layer_token_embd\.weight=CPU",   # Qwen3.8-Flash-Next / qwen4exp
+    r"token_embd\.weight=CPU",             # generic: plain embedding table
+]
 LOAD_MODE_OPTIONS = [None, "none", "mmap", "mlock", "mmap+mlock", "dio"]
 TEMP_OPTIONS     = [None, 0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 1.0, 1.2, 1.5]
 TOP_P_OPTIONS    = [None, 0.1, 0.5, 0.8, 0.9, 0.95, 1.0]
@@ -187,7 +301,7 @@ THINKING_BUDGET_OPTIONS  = [None, 0, 256, 1024, 4096, 8192, 16384, 32768]
 REASONING_FORMAT_OPTIONS = [None, "deepseek", "deepseek-legacy", "none"]
 # deepseek        → extracts thinking into reasoning_content (Open WebUI shows collapsible dropdown)
 # deepseek-legacy → keeps <think> tags in content but also populates reasoning_content
-# none            → strips all thinking tags from output entirely
+# none            → no special formatting; raw output stays in content (think tags included)
 # Union of values seen across templates; the settings menu narrows this to the
 # values the selected model's embedded template actually accepts.
 REASONING_EFFORT_OPTIONS = [None, "no_think", "low", "medium", "high", "xhigh", "max"]
@@ -197,12 +311,13 @@ REPEAT_PENALTY_OPTIONS   = [None, 1.0, 1.05, 1.1, 1.15, 1.2, 1.3, 1.5]
 PRESENCE_PENALTY_OPTIONS = [None, 0.0, 0.1, 0.3, 0.5, 0.8, 1.0, 1.2, 1.5, 1.8, 2.0]
 
 # Fields that support direct text entry for precision
-# (draft_model is free-form text: a file path, not a number)
+# (draft_model and override_tensor are free-form text - a file path and a
+#  tensor-placement regex - not numbers, so they skip the numeric parse below)
 EDITABLE_FIELDS = {"context", "temp", "top_p", "top_k", "min_p",
                    "repeat_penalty", "presence_penalty", "draft_model",
-                   "cache_ram"}
+                   "cache_ram", "parallel", "override_tensor"}
 # Editable fields parsed as whole numbers rather than floats
-INT_EDITABLE_FIELDS = {"context", "top_k", "cache_ram"}
+INT_EDITABLE_FIELDS = {"context", "top_k", "cache_ram", "parallel"}
 
 
 # ── Hard-coded per-model fixes ────────────────────────────────────────────────
@@ -238,7 +353,118 @@ MODEL_FIXES = [
             "repeat_penalty": None,   # flag omitted; server default 1.0 = off
         },
     },
+    {
+        # Qwen3.8-Flash-Next uses arch qwen4exp. Support for it (PR #27742,
+        # unslothai fork, branch qwen4exp/qwen3.8-flash-next) is merged into
+        # llama.cpp mainline, so the main build at LLAMA_SERVER handles it and
+        # no "server" override is needed; the private build in
+        # C:\tools\llamacpp-qwen4exp is no longer used.
+        "name": "qwen3.8-flash-next",
+        "match": "qwen3.8-flash-next",
+        "overrides": {
+            # unsloth card, thinking-mode preset
+            "temp":             1.0,
+            "top_p":            0.95,
+            "top_k":            20,
+            "min_p":            0.0,   # explicit: server default is 0.1, card says 0.0
+            "presence_penalty": 0.0,   # card says 0.0 in thinking mode
+            "repeat_penalty":   None,  # flag omitted; server default 1.0 = off
+            # Context is NOT capped here; the GGUF advertises 262144 and the
+            # user can set whatever value their hardware allows.
+        },
+    },
+    {
+        # GLM-5.3-Flash uses arch glm5next (HF model_type glm5_next), which no
+        # released llama.cpp knows: the stock server dies with "unknown model
+        # architecture: 'glm5next'". It exists only in two open draft PRs:
+        #   #27754 - unslothai fork, branch glm5next/upstream. Matches the
+        #            unsloth GGUFs, adds the vision tower too. This is the one
+        #            built into C:\tools\llamacpp-glm5next:
+        #              git clone --branch glm5next/upstream
+        #                  https://github.com/unslothai/llama.cpp
+        #              cmake llama.cpp -B llama.cpp/build
+        #                  -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON
+        #              cmake --build llama.cpp/build --config Release -j
+        #                  --clean-first --target llama-server llama-gguf-split
+        #   #27752 - eauchs, text-only, does not touch llama_memory_hybrid /
+        #            llama_kv_cache. Note it warns that a UNIFIED cache (-kvu)
+        #            mixes indexer pools across sequences and degrades
+        #            selection, so that build wants parallel=1 (now the
+        #            launcher default). #27754 has no such caveat.
+        # Drop this "server"/"env" pair once the arch lands in the main build.
+        "name": "glm-5.3-flash",
+        "match": "glm-5.3-flash",
+        "server": r"C:\tools\llamacpp-glm5next\llama-server.exe",
+        # ggml-cuda/common.cuh sets CUBLAS_TF32_TENSOR_OP_MATH unconditionally,
+        # so every fp32 GEMM runs at 10 mantissa bits. The PR measured top-1
+        # agreement moving 0.896 -> 0.9995 with TF32 off; the lightning
+        # indexer's weights_proj runs in fp32 and cannot afford the loss.
+        "env": {"NVIDIA_TF32_OVERRIDE": "0"},
+        # build_attn_mha casts the F32 latent to F16 before ggml_flash_attn_ext,
+        # which is the one place this model's MLA cannot afford it. flash_attn
+        # False only OMITS the flag (server default is auto), so state it.
+        "args": ["--flash-attn", "off"],
+        "overrides": {
+            # unsloth model card: temp 1.0 / top-p 0.95, no other samplers named.
+            # top_k 0 and min_p 0.0 disable them explicitly rather than letting
+            # the server defaults (40 / 0.1) sneak in.
+            "temp":               1.0,
+            "top_p":              0.95,
+            "top_k":              0,
+            "min_p":              0.0,
+            "repeat_penalty":     None,   # flags omitted; card names no penalty
+            "presence_penalty":   None,
+            "flash_attn":         False,  # see "args" above
+            # A quantized V cache REQUIRES flash attention, and -fa is off here,
+            # so both cache types must go back to f16. Cost is nil: the PR
+            # measured f16 at +0.0005 PPL at ctx 2048 and -0.0018 at 4096, both
+            # inside engine-to-engine noise.
+            "cache_type_k":       None,
+            "cache_type_v":       None,
+            # mlock tries to VirtualLock every CPU-side tensor. With ~90 GB of
+            # experts offloaded on a 128 GB box Windows refuses outright:
+            # "failed to VirtualLock 99528454144-byte buffer ... Insufficient
+            # system resources". mmap lets the page cache hold the experts and
+            # evict under pressure, which is the only workable mode at this size.
+            "load_mode":          "mmap",
+            # The embedded template gates thinking depth on reasoning_effort;
+            # unsloth's documented invocation passes "max".
+            "reasoning_effort":   "max",
+        },
+        # Sizing, not correctness - tune these from the settings menu.
+        "soft_defaults": {
+            # Tensor placement is left entirely to llama.cpp's auto-fitter.
+            # Sizing from the IQ3_XXS GGUF (excluding the unused blk.45 MTP
+            # block):
+            #
+            #   expert weights  102.32 GB over 42 MoE layers (3..44), 2.44 each
+            #   everything else   7.16 GB
+            #   total loaded    109.48 GB
+            #
+            # which does not fit a 32 GB card, so most experts have to live on
+            # the CPU. This used to be done by hand with --n-cpu-moe 40, which
+            # generated at <0.1 tok/s - the signature of the wrong tensors
+            # being swapped in and out. common_fit_params measures free VRAM
+            # itself and places them, so that flag is gone from the launcher.
+            # --cache-ram is the RAM prompt-cache budget (PR #16391): it lets a
+            # returning conversation skip re-prefill, which on a 321B model at
+            # 80K ctx is worth real minutes. Cut from the launcher's 16 GB to
+            # the server default 8 GB so the ~90 GB of offloaded experts keep
+            # their headroom on a 128 GB box; 0 would disable it outright.
+            "cache_ram": 8192,
+        },
+    },
 ]
+
+
+# Two kinds of per-model value live in MODEL_FIXES:
+#   "overrides"     - correctness. Applied in build_command AFTER the saved
+#                     settings, so they always win and cannot be edited away.
+#   "soft_defaults" - a starting point. Applied in cfg_for_model BETWEEN the
+#                     global DEFAULTS and the saved settings, so the settings
+#                     menu shows them, and anything the user saves wins.
+# Put a value in "soft_defaults" when it is a sizing/tuning choice rather than
+# a "this model is broken without it" fact.
 
 
 def find_model_fix(model: Path):
@@ -265,8 +491,11 @@ def _migrate_settings(data: dict) -> dict:
     """Retired-key fixups in place:
     gemma4_template_fix -> auto_template,
     no_mmap/mlock -> load_mode (old defaults no_mmap=True, mlock=True
-    equal the new "mlock" mode),
-    kv_unified removed (always enabled)."""
+    equal the new "mlock" mode).
+
+    kv_unified used to be stripped here, back when the launcher hard-coded
+    --kv-unified on. It is a real setting again (default True, i.e. the same
+    behaviour), so saved values are now kept."""
     for key, val in data.items():
         if key == "__meta__" or not isinstance(val, dict):
             continue
@@ -274,7 +503,6 @@ def _migrate_settings(data: dict) -> dict:
             val["auto_template"] = val.pop("gemma4_template_fix")
         if "live_search" in val:
             val["mcp_enabled"] = ["search"] if val.pop("live_search") else []
-        val.pop("kv_unified", None)
         if "no_mmap" in val or "mlock" in val:
             no_mmap = val.pop("no_mmap", True)
             mlock   = val.pop("mlock", True)
@@ -300,6 +528,9 @@ def save_settings(all_saved: dict):
 def cfg_for_model(model: Path, all_saved: dict) -> dict:
     saved = all_saved.get(str(model), {})
     cfg = dict(DEFAULTS)
+    fix = find_model_fix(model)
+    if fix:
+        cfg.update(fix.get("soft_defaults", {}))
     cfg.update(saved)
     return cfg
 
@@ -334,6 +565,30 @@ def last_launch_time(model: Path, all_saved: dict):
 
 # ── Model discovery ───────────────────────────────────────────────────────────
 
+# Vision towers usually announce themselves (mmproj-*, *-projector-*), but some
+# repos ship one as a plain "-vision-<dtype>" sibling of the LM, e.g.
+# Qwen3.8-27B-Uncensored-vision-f16.gguf next to ...-YMQ-XL.gguf. Match that
+# form only at the tail of the name and only for a small file, so a real VL
+# model (Llama-3.2-11B-Vision-Instruct-Q4_K_M.gguf) is not mistaken for one.
+VISION_TOWER_RE = re.compile(
+    r"[-_.](?:vision|visual|vit|clip)"
+    r"(?:[-_.](?:f16|f32|bf16|fp16|fp32|q\d\w*))?\.gguf$", re.IGNORECASE)
+VISION_TOWER_MAX_BYTES = 3 * 1024 ** 3
+
+
+def is_mmproj(path: Path) -> bool:
+    """True if this GGUF is a vision tower rather than a launchable model."""
+    n = path.name.lower()
+    if "mmproj" in n or "projector" in n:
+        return True
+    if not VISION_TOWER_RE.search(n):
+        return False
+    try:
+        return path.stat().st_size <= VISION_TOWER_MAX_BYTES
+    except OSError:
+        return False
+
+
 def find_models():
     models = []
     for base in MODEL_DIRS:
@@ -342,7 +597,7 @@ def find_models():
             continue
         for f in sorted(p.rglob("*.gguf")):
             name = f.name.lower()
-            if "mmproj" in name or "projector" in name:
+            if is_mmproj(f):
                 continue
             # Split GGUFs: only the first shard is launchable; llama-server
             # picks up the rest of the -NNNNN-of-NNNNN set automatically.
@@ -354,15 +609,33 @@ def find_models():
 
 
 def find_mmproj(model_path: Path):
-    for f in model_path.parent.glob("*.gguf"):
-        n = f.name.lower()
-        if "mmproj" in n or "projector" in n:
+    for f in sorted(model_path.parent.glob("*.gguf")):
+        if f != model_path and is_mmproj(f):
             return f
     return None
 
 
 def find_all_mmproj():
-    """Recursively scan all model dirs for mmproj-*.gguf files."""
+    """Recursively scan all model dirs for mmproj/projector GGUF files."""
+    found = []
+    for base in MODEL_DIRS:
+        p = Path(base)
+        if not p.exists():
+            continue
+        for f in sorted(p.rglob("*.gguf")):
+            if is_mmproj(f):
+                found.append(f)
+    return found
+
+
+# A separate drafter module, not a full MTP model: embedded-MTP quants draft
+# from their own nextn layers and never need to be picked here.
+DRAFT_NAME_RE = re.compile(
+    r"draft|nextn|eagle|medusa|speculat|mtp[-_]?(module|head)", re.IGNORECASE)
+
+
+def find_all_draft():
+    """Recursively scan all model dirs for separate draft/MTP module GGUFs."""
     found = []
     for base in MODEL_DIRS:
         p = Path(base)
@@ -370,7 +643,13 @@ def find_all_mmproj():
             continue
         for f in sorted(p.rglob("*.gguf")):
             n = f.name.lower()
-            if n.startswith("mmproj-") or ("mmproj" in n or "projector" in n):
+            if is_mmproj(f):
+                continue
+            shard = re.search(r"-(\d{5})-of-\d{5}\.gguf$", n)
+            if shard and shard.group(1) != "00001":
+                continue
+            # Drafters are also named by prefix alone, e.g. mtp-Qwen3.8-27B-Q4_0.gguf
+            if n.startswith("mtp") or DRAFT_NAME_RE.search(f.name):
                 found.append(f)
     return found
 
@@ -436,6 +715,15 @@ TEMPLATE_OVERRIDES = [
     # instead of an empty <think></think>. Older GGUFs still embed the broken
     # template, so keep this override until the quants are re-uploaded.
     ("laguna", "Laguna-S-2.1.jinja"),
+    # Qwen3.8-Flash-Next (arch qwen4exp) is NOT the dense Qwen3.8: its template
+    # is vision-aware (image/video pads) and merges leading system messages
+    # itself. It must be matched BEFORE the "qwen3.8" entry below, which would
+    # otherwise swallow it and hand a text-only 27B template to a VL model.
+    # It carries the same 'System message must be at the beginning.' raise, so
+    # Qwen3.8-Flash-Next.jinja is the embedded template with that one raise
+    # replaced by a plain <|im_start|>system turn; everything else is
+    # byte-identical. Its reasoning_effort scale is xhigh (default)/medium/low.
+    ("qwen3.8-flash-next", "Qwen3.8-Flash-Next.jinja"),
     # Qwen3.8's embedded template raises 'System message must be at the
     # beginning.' for any system message that is not messages[0]. Claude Code
     # (2.1.232) sends its agent-type/skill listing as a system-role message
@@ -446,6 +734,19 @@ TEMPLATE_OVERRIDES = [
     # plain <|im_start|>system turn; everything else is byte-identical. Taken
     # from the 27B GGUF, and the Qwen3.8 sizes share this template.
     ("qwen3.8", "Qwen3.8.jinja"),
+]
+
+# Models whose GGUF-embedded template is correct but whose filename fools the
+# token scorer into handing them someone else's. Matched case-insensitively
+# against the model filename; a hit disables auto-matching for that model, so
+# the server uses the embedded template. Substrings, same as the list above.
+#
+# glm-5.3-flash: "GLM-5.3-Flash-UD-IQ3_XXS" scores 2 against
+# stepfun-ai-Step-3.5-Flash.jinja purely on the shared {3, 5, flash} tokens,
+# which is exactly the threshold, so the launcher was feeding a Step-3.5
+# template to a GLM model.
+TEMPLATE_BLOCKLIST = [
+    "glm-5.3-flash",
 ]
 
 
@@ -475,6 +776,9 @@ def find_template_for_model(model: Path):
     override = find_template_override(model)
     if override is not None:
         return override
+    name = model.name.lower()
+    if any(needle in name for needle in TEMPLATE_BLOCKLIST):
+        return None
     model_norm = _normalize(model.stem)
     model_tokens = _template_tokens(model.stem)
 
@@ -625,17 +929,29 @@ def collect_mcp_servers(cfg: dict) -> dict:
     return defs
 
 
+def build_env(model: Path) -> dict | None:
+    """Process environment for the server, or None to inherit unchanged."""
+    fix = find_model_fix(model)
+    extra = fix.get("env") if fix else None
+    if not extra:
+        return None
+    return {**os.environ, **extra}
+
+
 def build_command(model: Path, cfg: dict) -> list:
     server = LLAMA_SERVER
     fix_args = []
     fix = find_model_fix(model)
     if fix:
         cfg = {**cfg, **fix["overrides"]}
+        # "args" always apply; "fallback_args" only when the patched build is
+        # missing and we are falling back to the stock server.
+        fix_args = list(fix.get("args", []))
         patched = fix.get("server")
         if patched and Path(patched).exists():
             server = patched
         else:
-            fix_args = fix.get("fallback_args", [])
+            fix_args += fix.get("fallback_args", [])
     cmd = [server, "-m", str(model)]
     visual = cfg.get("visual_model")
     if visual == "none":
@@ -662,7 +978,8 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["-ctv", cfg["cache_type_v"]]
     if cfg.get("cache_ram") is not None:
         cmd += ["--cache-ram", str(cfg["cache_ram"])]
-    cmd += ["--kv-unified"]
+    if cfg.get("kv_unified"):
+        cmd += ["--kv-unified"]
     if cfg.get("verbosity") is not None:
         cmd += ["--verbosity", str(cfg["verbosity"])]
     if cfg.get("batch"):
@@ -671,6 +988,8 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["-ub", str(cfg["ubatch"])]
     if cfg.get("load_mode"):
         cmd += ["--load-mode", cfg["load_mode"]]
+    if cfg.get("override_tensor"):
+        cmd += ["-ot", cfg["override_tensor"]]
     if cfg.get("temp") is not None:
         cmd += ["--temp", str(cfg["temp"])]
     if cfg.get("top_p") is not None:
@@ -750,8 +1069,8 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--presence-penalty", str(cfg["presence_penalty"])]
     if fix_args:
         cmd += fix_args
-    cmd += ["--parallel", "4"]
-    #cmd += ["--no-warmup"]
+    if cfg.get("parallel") is not None:
+        cmd += ["--parallel", str(cfg["parallel"])]
     return cmd
 
 
@@ -818,6 +1137,9 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         if ubat is not None:  parts.append(f"ub={ubat}")
         if cfg.get("load_mode"): parts.append(f"load={cfg['load_mode']}")
         if cfg.get("cache_ram") is not None: parts.append(f"cram={cfg['cache_ram']}")
+        if cfg.get("override_tensor"): parts.append(f"ot={cfg['override_tensor']}")
+        parts.append(f"kvu={'on' if cfg.get('kv_unified') else 'off'}")
+        if cfg.get("parallel") is not None: parts.append(f"par={cfg['parallel']}")
         if cfg.get("temp")  is not None: parts.append(f"temp={cfg['temp']}")
         if cfg.get("top_p") is not None: parts.append(f"top_p={cfg['top_p']}")
         if cfg.get("top_k") is not None: parts.append(f"top_k={cfg['top_k']}")
@@ -921,7 +1243,9 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
 # ── Inline value editor ───────────────────────────────────────────────────────
 
 def inline_edit(stdscr, label, current_val):
-    """Show a bottom-bar text input; returns parsed value or None on cancel."""
+    """Show a bottom-bar text input. Returns the entered string, None for
+    blank/"none" (meaning "use default"), or current_val if Esc is pressed
+    (meaning "keep the current value")."""
     h, w = stdscr.getmaxyx()
     curses.curs_set(1)
     buf = "" if current_val is None else str(current_val)
@@ -1166,6 +1490,14 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
     for f in all_mmproj:
         visual_labels[str(f)] = f"{f.name}  ({f.parent})"
 
+    # Draft/MTP module options, same shape as the visual model list: None
+    # (no separate drafter) followed by every draft-looking GGUF found.
+    all_draft = find_all_draft()
+    draft_options = [None] + [str(f) for f in all_draft]
+    draft_labels = {None: "none (embedded MTP)"}
+    for f in all_draft:
+        draft_labels[str(f)] = f"{f.name}  ({f.parent})"
+
     # Narrow reasoning_effort choices to what this model's embedded template
     # actually reads, and build a hint line describing its thinking switches.
     effort_options = REASONING_EFFORT_OPTIONS
@@ -1208,6 +1540,9 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
         ("port",         "Port",               None),
         ("flash_attn",   "Flash attention",    [True, False]),
         ("cache_ram",    "Cache RAM MB (--cache-ram)", CACHE_RAM_OPTIONS),
+        ("override_tensor", "Tensor placement (-ot)", OVERRIDE_TENSOR_OPTIONS),
+        ("kv_unified",   "KV unified (--kv-unified)", KV_UNIFIED_OPTIONS),
+        ("parallel",     "Parallel slots (--parallel)", PARALLEL_OPTIONS),
         ("batch",        "Batch size (-b)",    BATCH_OPTIONS),
         ("ubatch",       "Micro-batch (-ub)",  BATCH_OPTIONS),
         ("load_mode",      "Load mode (--load-mode)", LOAD_MODE_OPTIONS),
@@ -1219,7 +1554,7 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
         ("thinking",         "Thinking (on/off)",       THINKING_OPTIONS),
         ("draft_mtp",      "Draft MTP (--spec-type)",  [False, True]),
         ("draft_n_max",    "MTP draft tokens (n-max)", DRAFT_N_MAX_OPTIONS),
-        ("draft_model",    "Draft GGUF (-md, optional)", None),
+        ("draft_model",    "Draft GGUF (-md, optional)", draft_options),
         ("visual_model",   "Visual model (mmproj)",    visual_options),
     ]
     tabs = [("Main", main_fields), ("Advanced", advanced_fields)]
@@ -1260,7 +1595,7 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
             elif key == "__copy__":
                 display = "enter = pick a model to copy its settings from"
             elif key == "draft_model":
-                display = Path(val).name if val else "none"
+                display = draft_labels.get(val, Path(val).name if val else "none")
             elif key == "visual_model":
                 display = visual_labels.get(val, Path(val).name if val else "auto (same folder)")
             else:
@@ -1315,8 +1650,8 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
                 raw = inline_edit(stdscr, flabel, cfg.get(fkey))
                 if raw is None:
                     cfg[fkey] = None
-                elif fkey == "draft_model":
-                    cfg[fkey] = raw  # free-form path, no numeric parsing
+                elif fkey in ("draft_model", "override_tensor"):
+                    cfg[fkey] = raw  # free-form path / regex, no numeric parsing
                 else:
                     try:
                         cfg[fkey] = (int(raw) if fkey in INT_EDITABLE_FIELDS
@@ -1492,11 +1827,15 @@ def main(stdscr):
             model = models[sel]
             persist_cfg(model, cfg, all_saved, is_launch=True)
             cmd = build_command(model, cfg)
+            env = build_env(model)
             curses.endwin()
             print("Launching:")
+            fix = find_model_fix(model)
+            for k, v in (fix.get("env") or {}).items() if fix else ():
+                print(f"set {k}={v}")
             print(subprocess.list2cmdline(cmd))
             print()
-            subprocess.run(cmd)
+            subprocess.run(cmd, env=env)
             return
 
 

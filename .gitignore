@@ -5,3 +5,5 @@ model_selector.bat
 replacements.txt
 __pycache__/
 *.pyc
+model_settings.json.bak
+mcp/
