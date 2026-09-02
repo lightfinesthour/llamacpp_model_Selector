@@ -149,9 +149,9 @@ DEFAULTS = {
     # request; on False the server splits it into `parallel` equal shares, so
     # -c 80000 --parallel 4 gives each request only 20000. True = flag emitted,
     # False = flag omitted (server default). Note that architectures doing
-    # cache-order-dependent work can care: PR #27752's glm5next indexer pools
-    # mix cells across sequences under a unified cache. Not an issue at
-    # parallel=1, where there is only one sequence either way.
+    # cache-order-dependent work can care, since a unified cache mixes cells
+    # across sequences. Not an issue at parallel=1, where there is only one
+    # sequence either way.
     "kv_unified":   True,
     # -ot / --override-tensor: force individual tensors onto a chosen device by
     # regex, overriding whatever -ngl decided for them. Format is
@@ -175,8 +175,8 @@ DEFAULTS = {
     # 0.38 tok/s with just the per_layer_token_embd rule set. Sixty times slower.
     #
     # --n-cpu-moe had the same effect - it is implemented as tensor overrides
-    # internally, so setting it also switched the auto-fitter off, and on
-    # GLM-5.3-Flash that produced <0.1 tok/s. That flag is no longer emitted by
+    # internally, so setting it also switched the auto-fitter off, and on a
+    # large MoE that produced <0.1 tok/s. That flag is no longer emitted by
     # this launcher at all; -ot is the only remaining way to override placement.
     #
     # So: leave this at default unless the auto-fitter is demonstrably doing
@@ -340,121 +340,7 @@ INT_EDITABLE_FIELDS = {"context", "top_k", "cache_ram", "parallel"}
 #     Both branches sit inside {%- if thinking -%}, so reasoning_effort only
 #     takes effect when thinking is on (--reasoning on) - the template's own
 #     default is thinking = false.
-MODEL_FIXES = [
-    {
-        "name": "dsv4-flash",
-        "match": "deepseek-v4-flash",
-        "overrides": {
-            "jinja":          True,
-            "temp":           1.0,
-            "top_p":          1.0,
-            "top_k":          0,      # 0 = top-k disabled in llama.cpp
-            "min_p":          0.0,
-            "repeat_penalty": None,   # flag omitted; server default 1.0 = off
-        },
-    },
-    {
-        # Qwen3.8-Flash-Next uses arch qwen4exp. Support for it (PR #27742,
-        # unslothai fork, branch qwen4exp/qwen3.8-flash-next) is merged into
-        # llama.cpp mainline, so the main build at LLAMA_SERVER handles it and
-        # no "server" override is needed; the private build in
-        # C:\tools\llamacpp-qwen4exp is no longer used.
-        "name": "qwen3.8-flash-next",
-        "match": "qwen3.8-flash-next",
-        "overrides": {
-            # unsloth card, thinking-mode preset
-            "temp":             1.0,
-            "top_p":            0.95,
-            "top_k":            20,
-            "min_p":            0.0,   # explicit: server default is 0.1, card says 0.0
-            "presence_penalty": 0.0,   # card says 0.0 in thinking mode
-            "repeat_penalty":   None,  # flag omitted; server default 1.0 = off
-            # Context is NOT capped here; the GGUF advertises 262144 and the
-            # user can set whatever value their hardware allows.
-        },
-    },
-    {
-        # GLM-5.3-Flash uses arch glm5next (HF model_type glm5_next), which no
-        # released llama.cpp knows: the stock server dies with "unknown model
-        # architecture: 'glm5next'". It exists only in two open draft PRs:
-        #   #27754 - unslothai fork, branch glm5next/upstream. Matches the
-        #            unsloth GGUFs, adds the vision tower too. This is the one
-        #            built into C:\tools\llamacpp-glm5next:
-        #              git clone --branch glm5next/upstream
-        #                  https://github.com/unslothai/llama.cpp
-        #              cmake llama.cpp -B llama.cpp/build
-        #                  -DBUILD_SHARED_LIBS=OFF -DGGML_CUDA=ON
-        #              cmake --build llama.cpp/build --config Release -j
-        #                  --clean-first --target llama-server llama-gguf-split
-        #   #27752 - eauchs, text-only, does not touch llama_memory_hybrid /
-        #            llama_kv_cache. Note it warns that a UNIFIED cache (-kvu)
-        #            mixes indexer pools across sequences and degrades
-        #            selection, so that build wants parallel=1 (now the
-        #            launcher default). #27754 has no such caveat.
-        # Drop this "server"/"env" pair once the arch lands in the main build.
-        "name": "glm-5.3-flash",
-        "match": "glm-5.3-flash",
-        "server": r"C:\tools\llamacpp-glm5next\llama-server.exe",
-        # ggml-cuda/common.cuh sets CUBLAS_TF32_TENSOR_OP_MATH unconditionally,
-        # so every fp32 GEMM runs at 10 mantissa bits. The PR measured top-1
-        # agreement moving 0.896 -> 0.9995 with TF32 off; the lightning
-        # indexer's weights_proj runs in fp32 and cannot afford the loss.
-        "env": {"NVIDIA_TF32_OVERRIDE": "0"},
-        # build_attn_mha casts the F32 latent to F16 before ggml_flash_attn_ext,
-        # which is the one place this model's MLA cannot afford it. flash_attn
-        # False only OMITS the flag (server default is auto), so state it.
-        "args": ["--flash-attn", "off"],
-        "overrides": {
-            # unsloth model card: temp 1.0 / top-p 0.95, no other samplers named.
-            # top_k 0 and min_p 0.0 disable them explicitly rather than letting
-            # the server defaults (40 / 0.1) sneak in.
-            "temp":               1.0,
-            "top_p":              0.95,
-            "top_k":              0,
-            "min_p":              0.0,
-            "repeat_penalty":     None,   # flags omitted; card names no penalty
-            "presence_penalty":   None,
-            "flash_attn":         False,  # see "args" above
-            # A quantized V cache REQUIRES flash attention, and -fa is off here,
-            # so both cache types must go back to f16. Cost is nil: the PR
-            # measured f16 at +0.0005 PPL at ctx 2048 and -0.0018 at 4096, both
-            # inside engine-to-engine noise.
-            "cache_type_k":       None,
-            "cache_type_v":       None,
-            # mlock tries to VirtualLock every CPU-side tensor. With ~90 GB of
-            # experts offloaded on a 128 GB box Windows refuses outright:
-            # "failed to VirtualLock 99528454144-byte buffer ... Insufficient
-            # system resources". mmap lets the page cache hold the experts and
-            # evict under pressure, which is the only workable mode at this size.
-            "load_mode":          "mmap",
-            # The embedded template gates thinking depth on reasoning_effort;
-            # unsloth's documented invocation passes "max".
-            "reasoning_effort":   "max",
-        },
-        # Sizing, not correctness - tune these from the settings menu.
-        "soft_defaults": {
-            # Tensor placement is left entirely to llama.cpp's auto-fitter.
-            # Sizing from the IQ3_XXS GGUF (excluding the unused blk.45 MTP
-            # block):
-            #
-            #   expert weights  102.32 GB over 42 MoE layers (3..44), 2.44 each
-            #   everything else   7.16 GB
-            #   total loaded    109.48 GB
-            #
-            # which does not fit a 32 GB card, so most experts have to live on
-            # the CPU. This used to be done by hand with --n-cpu-moe 40, which
-            # generated at <0.1 tok/s - the signature of the wrong tensors
-            # being swapped in and out. common_fit_params measures free VRAM
-            # itself and places them, so that flag is gone from the launcher.
-            # --cache-ram is the RAM prompt-cache budget (PR #16391): it lets a
-            # returning conversation skip re-prefill, which on a 321B model at
-            # 80K ctx is worth real minutes. Cut from the launcher's 16 GB to
-            # the server default 8 GB so the ~90 GB of offloaded experts keep
-            # their headroom on a 128 GB box; 0 would disable it outright.
-            "cache_ram": 8192,
-        },
-    },
-]
+MODEL_FIXES = []
 
 
 # Two kinds of per-model value live in MODEL_FIXES:
@@ -740,14 +626,7 @@ TEMPLATE_OVERRIDES = [
 # token scorer into handing them someone else's. Matched case-insensitively
 # against the model filename; a hit disables auto-matching for that model, so
 # the server uses the embedded template. Substrings, same as the list above.
-#
-# glm-5.3-flash: "GLM-5.3-Flash-UD-IQ3_XXS" scores 2 against
-# stepfun-ai-Step-3.5-Flash.jinja purely on the shared {3, 5, flash} tokens,
-# which is exactly the threshold, so the launcher was feeding a Step-3.5
-# template to a GLM model.
-TEMPLATE_BLOCKLIST = [
-    "glm-5.3-flash",
-]
+TEMPLATE_BLOCKLIST = []
 
 
 def find_template_override(model: Path):
@@ -988,8 +867,9 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["-ub", str(cfg["ubatch"])]
     if cfg.get("load_mode"):
         cmd += ["--load-mode", cfg["load_mode"]]
-    if cfg.get("override_tensor"):
-        cmd += ["-ot", cfg["override_tensor"]]
+    ot_rules = [r for r in (cfg.get("override_tensor") or "").split(",") if r.strip()]
+    if ot_rules:
+        cmd += ["-ot", ",".join(ot_rules)]
     if cfg.get("temp") is not None:
         cmd += ["--temp", str(cfg["temp"])]
     if cfg.get("top_p") is not None:
