@@ -1,88 +1,63 @@
 # llama.cpp Model Selector
 
-A keyboard-driven terminal UI for launching `llama-server` from your GGUF model library. Automatically detects vision models, remembers per-model settings across sessions, and lets you search and sort your collection.
+A keyboard-driven Windows terminal UI for launching local GGUF models with `llama-server`, with per-model settings, search, sorting, template selection, and optional MCP integrations.
 
-## Requirements
+## Setup
 
-- Python 3.12+
-- `windows-curses` (Windows only)
+Requires Python 3.12+ and a compatible local llama-server build:
 
-```
-pip install windows-curses
-```
-
-## Usage
-
-```
+```powershell
+pip install windows-curses python-dotenv
 python model_selector.py
 ```
+
+Edit `LLAMA_SERVER`, `MODEL_DIRS`, and `TEMPLATES_DIR` near the top of `model_selector.py` for your machine. The configured model directories are `C:\llm`, `E:\llm`, `K:\models`, and `M:\models`. Missing directories are skipped. Only the first shard of a split GGUF is listed; its displayed size includes sibling shards.
+
+Copy `.env.example` to `.env` to configure `LLAMA_HOST` and the default `LLAMA_PORT`. A saved per-model port takes precedence. This launcher uses flags supported by the installed build at `C:\tools\llamacpp\llama-server.exe`; check your build's `--help` if using another version.
 
 ## Navigation
 
 | Key | Action |
 |-----|--------|
-| `↑ / ↓` | Move through model list |
-| `PgUp / PgDn` | Jump 10 models |
-| `Enter` | Launch selected model |
-| `s` | Open settings menu |
-| `/` | Search / filter models |
-| `o` | Toggle sort: name ↔ last launched |
-| `r` | Rescan model directories |
-| `d` | Delete saved settings for selected model |
-| `q` / `Esc` | Quit |
+| Up / Down | Select model |
+| PgUp / PgDn | Jump 10 models |
+| Enter | Launch selected model and exit the selector when the server stops |
+| s | Open settings |
+| c | Copy settings from another saved model |
+| / | Filter by name or path; Enter or Esc keeps the filter |
+| o | Toggle name / last-launch sorting |
+| r | Rescan model directories |
+| d | Clear selected model's saved settings and launch timestamp |
+| q / Esc | Quit |
 
-## Model List Indicators
+Open `/` and press Enter with an empty query to clear the filter. `*` marks saved settings, `>` marks a previously launched model, and `[V]` marks a configured vision projector (or one found in auto mode).
 
-```
- >[V]* 12.3GB  subfolder\model-name.gguf
- ^  ^  ^
- |  |  └─ file size
- |  └──── * = has saved settings
- └─────── > = previously launched  [V] = vision capable (mmproj found)
-```
+## Settings
 
-## Settings (`s`)
+The Main tab contains context size, cache types, sampling, reasoning effort, MCP selection, and settings copying. Press Tab / Shift-Tab for Advanced settings: threads, port, Flash Attention, RAM cache, tensor placement, unified KV, parallel slots, batching, load mode, Jinja/templates, reasoning controls, MTP drafting, draft-cache types, and vision.
 
-| Setting | Flag | Description |
-|---------|------|-------------|
-| Context length | `-c` | Token context window size |
-| Threads | `--threads` | CPU threads |
-| GPU layers | `-ngl` | Layers offloaded to GPU (999 = all) |
-| Port | `--port` | Server port |
-| Flash attention | `--flash-attn` | Enable flash attention |
-| Cache K | `-ctk` | KV cache quantisation for keys |
-| Cache V | `-ctv` | KV cache quantisation for values |
-| Verbosity | `--verbosity` | Log verbosity level (0–5) |
-| Parallel slots | `-np` | Number of simultaneous request slots |
-| Batch size | `-b` | Prompt processing batch size |
-| Micro-batch | `-ub` | Micro-batch size for pipeline |
-| mlock | `--mlock` | Pin model in RAM (prevent swapping) |
+Use Up / Down to select a field and Left / Right or + / - to cycle values. Fields marked `[*]` accept text with Enter; blank or `none` selects the default, and Esc cancels editing. Enter on `[>]` opens a submenu. Press q, s, or Esc to close settings and save; Enter on other fields also closes and saves. The settings list scrolls to keep the selected field visible.
 
-Navigate fields with `↑ / ↓`, change values with `← / →` or `+` / `-`. Settings are **saved per model** when you press `Enter` to launch or `s` to close the menu.
+The launcher always passes `-ngl -1`; GPU layer count is not a menu setting. Most optional settings omit their flag when set to `default`. Jinja is forced on when required by template matching, reasoning-effort kwargs, or enabled MCP definitions.
 
-## Vision Models
+Copying uses the source model's resolved settings. Vision and draft file paths stay unchanged unless you toggle their inclusion with Tab in the copy menu. Host is never copied.
 
-If a `mmproj-*.gguf` file is found in the same directory as the selected model, the selector automatically adds `--mmproj` to the launch command. Vision-capable models are tagged `[V]` in the list.
+## Vision and templates
 
-## Model Directories
+Vision is **disabled by default**. Set Advanced → Visual model to auto to search the model's folder, or select a projector explicitly. Auto mode selects the first sorted matching file; verify it belongs to your model if the directory contains several projectors. Projector detection uses filename patterns and, for some vision-tower names, a size limit.
 
-The selector recursively scans these directories:
+Auto-match selects a local `.jinja` template by filename heuristics and otherwise uses the GGUF's embedded template. Explicit `TEMPLATE_OVERRIDES` mappings apply even when auto-match is off. Inspect the command preview to see the selected template. Reasoning-effort hints are inferred from the embedded template and can differ from a local override.
 
-```
-C:\llm
-E:\llm
-```
+## Optional MCP integrations
 
-Edit `MODEL_DIRS` at the top of `model_selector.py` to change them.
+The registry contains search, Godot, Playwright, Blender, and Unreal integrations. Their dependencies live under the ignored `mcp/` directory and are not included in this repository. Configure their paths and endpoints in `model_selector.py`. An enabled entry is skipped if its declared prerequisite is missing; this does not verify all dependencies or service availability. HTTP services require the local stdio bridge, and the remote service/editor must be running.
 
-## Settings File
+## Saved settings and checks
 
-Per-model settings are stored in `model_settings.json` next to the script. Only values that differ from defaults are written. Delete the file to reset everything, or press `d` on a model to reset just that one.
+`model_settings.json` stores differences from each model's defaults plus last-used/launch metadata. Host is environment-managed and is not saved. Saves replace the file atomically. Invalid JSON stops loading rather than silently discarding settings; repair the file or move it aside to reset it. Press d to reset one model, or remove the file to reset all settings and history.
 
-## llama-server Path
+Run regression checks without loading a model:
 
-The path to `llama-server.exe` is set at the top of the script:
-
-```python
-LLAMA_SERVER = r"C:\tools\llamacpp\llama-server.exe"
+```powershell
+python -m unittest discover -s tests -v
 ```

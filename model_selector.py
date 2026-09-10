@@ -13,6 +13,7 @@ import json
 import subprocess
 import curses
 import time
+import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -23,27 +24,8 @@ MODEL_DIRS   = [r"C:\llm", r"E:\llm", r"K:\models", r"M:\models"]
 TEMPLATES_DIR = Path(r"C:\tools\llamacpp\templates")
 SETTINGS_FILE = Path(__file__).parent / "model_settings.json"
 
-# ── MCP server registry ───────────────────────────────────────────────────────
-# Servers the MCP menu can toggle per model (cfg["mcp_enabled"] holds the
-# enabled names). Every server is vendored into its own folder under mcp/ next
-# to this script and every path below is derived from MCP_DIR, so the launcher
-# is self-contained: move or copy the whole directory and the servers move with
-# it. Nothing outside this folder is needed except node (for godot) and the
-# base Python installs the two vendored venvs were created from.
-#   mcp/search       SearXNG-backed web search, runs from mcp/search/.venv
-#   mcp/godot        node bundle + the Godot console build it drives
-#   mcp/playwright   browser automation, reached over streamable-HTTP via
-#                    mcp/http_bridge (the bridge is not a server itself)
-#   mcp/blender      blender-mcp package in its own venv (python -m blmcp)
-#   mcp/unreal581    configs only - the server lives inside UnrealEditor
-# An entry either points at a Cursor-format config_file whose mcpServers
-# definitions are merged in, or carries an inline definition (used for all
-# four here, so no absolute path is baked into a config file on disk).
-# Remote streamable-HTTP servers go through mcp_http_bridge.py, because this
-# llama-server build only speaks MCP over stdio: the bridge is spawned by
-# llama-server itself and relays NDJSON <-> HTTP (it opens its own console
-# window for logs; closing that window disconnects just that server).
-# Adding a server = drop it in mcp/<name>/ and add one dict entry here.
+# Optional MCP integrations installed under mcp/. HTTP endpoints use the
+# local stdio bridge; remote services must be running separately.
 MCP_DIR = Path(__file__).parent / "mcp"
 
 # Web-search MCP server (SearXNG-backed), with its own virtualenv.
@@ -62,22 +44,10 @@ PLAYWRIGHT_MCP_URL = "http://100.92.156.106:8931/mcp"
 # llama-server only speaks MCP over stdio, so the http_bridge relays between
 # stdio (server-side) and the remote HTTP endpoint.
 
-# Blender MCP server (official Blender Lab bridge from
-# projects.blender.org/lab/blender_mcp, installed into mcp/blender/venv and
-# launched as `python -m blmcp`); it talks to the MCP add-on running inside
-# Blender on localhost:9876, so Blender must be open with the add-on's server
-# started for its tools to answer.
+# Blender must be open with its MCP add-on server running.
 MCP_BLENDER_PYTHON = MCP_DIR / "blender" / "venv" / "Scripts" / "python.exe"
 
-# Unreal Engine 5.8's built-in MCP server (Engine/Plugins/Experimental/
-# ModelContextProtocol, experimental). Nothing is vendored: the server is
-# hosted by the UnrealEditor process itself, so it answers only while the
-# editor is open with the "Unreal MCP" and "All Toolsets" plugins enabled and
-# the server started (Editor Preferences -> Model Context Protocol, or the
-# console command ModelContextProtocol.StartServer 8000). It speaks
-# streamable-HTTP on localhost, so it goes through the same http_bridge as
-# playwright. mcp/unreal581 holds the ready-made client configs and setup
-# notes; keep the port here in sync with the ones in that folder.
+# UnrealEditor hosts this endpoint; the local bridge connects over HTTP.
 UNREAL_MCP_URL     = "http://127.0.0.1:8000/mcp"
 
 MCP_SERVERS = {
@@ -92,7 +62,7 @@ MCP_SERVERS = {
     },
     "godot": {
         "label": "Godot (game engine)",
-        "note":  "157 godot/scene/script tools",
+        "note":  "Godot scene/script tools",
         "requires": MCP_GODOT_ENTRY,
         "definition": {
             "type": "stdio",
@@ -103,7 +73,7 @@ MCP_SERVERS = {
     },
     "playwright": {
         "label": "Playwright (browser)",
-        "note":  "24 browser_* tools",
+        "note":  "browser automation tools",
         "endpoint": PLAYWRIGHT_MCP_URL,
         "requires": MCP_HTTP_BRIDGE,
         "definition": {
@@ -113,7 +83,7 @@ MCP_SERVERS = {
     },
     "blender": {
         "label": "Blender (3D)",
-        "note":  "26 tools, needs Blender open on :9876",
+        "note":  "needs Blender open on :9876",
         "requires": MCP_BLENDER_PYTHON,
         "definition": {
             "command": str(MCP_BLENDER_PYTHON),
@@ -140,80 +110,25 @@ DEFAULTS = {
     "flash_attn":   True,
     "cache_type_k": "q8_0",
     "cache_type_v": "q8_0",
-    # RAM cache size in MB for --cache-ram. Allows offloading the KV cache
-    # to system memory when it does not fit in VRAM. None = flag omitted.
+    # Maximum server prompt cache size in MiB; None omits --cache-ram.
     "cache_ram":    16384,
     "verbosity":    3,
-    # --kv-unified: one shared KV cache for every sequence instead of one slab
-    # per --parallel slot. On True the whole -c context is available to a single
-    # request; on False the server splits it into `parallel` equal shares, so
-    # -c 80000 --parallel 4 gives each request only 20000. True = flag emitted,
-    # False = flag omitted (server default). Note that architectures doing
-    # cache-order-dependent work can care, since a unified cache mixes cells
-    # across sequences. Not an issue at parallel=1, where there is only one
-    # sequence either way.
+    # Share a KV buffer across sequences; False explicitly disables sharing.
     "kv_unified":   True,
-    # -ot / --override-tensor: force individual tensors onto a chosen device by
-    # regex, overriding whatever -ngl decided for them. Format is
-    # <name-regex>=<device>, device being CPU, CUDA0, CUDA1, ...; several rules
-    # are separated by commas.
-    #
-    # ###  READ THIS BEFORE SETTING IT  ###
-    #
-    # Setting this DISABLES llama.cpp's automatic VRAM fitter. The startup log
-    # says so out loud:
-    #
-    #   W common_fit_params: failed to fit params to free device memory:
-    #       model_params::tensor_buft_overrides already set by user, abort
-    #
-    # Normally common_fit_params measures free VRAM and works out which layers
-    # to offload. That pass is doing the heavy lifting on any model bigger than
-    # the card. As soon as ANY tensor override exists it gives up and obeys the
-    # literal flags instead - and the literal flag here is -ngl -1, "all layers
-    # on the GPU". On a model that does not fit, that means constant thrashing.
-    # Measured on Qwen3.8-Flash-Next, 32 GB card: 21 tok/s with this unset,
-    # 0.38 tok/s with just the per_layer_token_embd rule set. Sixty times slower.
-    #
-    # --n-cpu-moe had the same effect - it is implemented as tensor overrides
-    # internally, so setting it also switched the auto-fitter off, and on a
-    # large MoE that produced <0.1 tok/s. That flag is no longer emitted by
-    # this launcher at all; -ot is the only remaining way to override placement.
-    #
-    # So: leave this at default unless the auto-fitter is demonstrably doing
-    # something dumb. If you do set it, you own the whole placement decision -
-    # tune the rules by hand while watching these log lines:
-    #     load_tensors: CUDA0 model buffer size = ..... MiB
-    #     load_tensors:   CPU model buffer size = ..... MiB
-    #
-    # None = flag omitted; llama.cpp's auto-fitter places every tensor. This is
-    # almost always what you want.
+    # Comma-separated tensor-regex=device rules. Manual placement can affect
+    # automatic fitting; check memory use when overriding it. None omits -ot.
     "override_tensor": None,
-    # --parallel: concurrent request slots. 1 = strictly one request at a time,
-    # which is what a single interactive client wants: no context is reserved
-    # for slots nobody is using, and the model never time-slices between two
-    # generations. Raise it only when several clients really do hit the server
-    # at once. None = flag omitted (server default 1).
+    # Concurrent request slots; None leaves the server default.
     "parallel":     1,
     "batch":        512,
     "ubatch":       None,
-    # Model loading mode. Replaces the deprecated --no-mmap / --mlock flags.
-    # "mlock" = load to RAM without mmap, pinned (no swapping). Even with
-    # -ngl -1 some tensors stay on the CPU, and the server warns that mmap
-    # with CPU tensor overrides is slower than a direct RAM buffer, so the
-    # non-mmap "mlock" mode (the old no_mmap=True, mlock=True defaults) is
-    # the recommended default here. Values: none, mmap, mlock, mmap+mlock,
-    # dio. None = flag omitted (server default: mmap).
+    # --load-mode; None leaves the server default.
     "load_mode":       "mlock",
     "temp":            1.0,
     "top_p":           0.95,
     "top_k":           20,
     "min_p":           None,
-    # thinking=True emits --reasoning on, which makes the SERVER DEFAULT
-    # thinking-on. Note: the built-in WebUI can still override this per-request
-    # if its custom-JSON field sends chat_template_kwargs {"enable_thinking":
-    # false}. Keep that WebUI field EMPTY (or set it to enable_thinking: true)
-    # so the server default wins. The launcher cannot control that field; it is
-    # a per-request browser setting.
+    # Server reasoning default; individual requests may override it.
     "thinking":         True,
     "thinking_budget":  None,
     # deepseek puts thoughts in message.reasoning_content (clean separation the
@@ -226,14 +141,8 @@ DEFAULTS = {
     # --chat-template-kwargs '{"reasoning_effort": ...}'; forces --jinja.
     # None = flag omitted, template default applies.
     "reasoning_effort": None,
-    # Keep thinking blocks from earlier assistant turns in the history instead
-    # of only the last one. Only works on templates that read a preserve_thinking
-    # kwarg (llama-server logs "chat template supports preserving reasoning" at
-    # startup when it applies). Better multi-turn coherence, costs context.
-    # True = --reasoning-preserve, False = --no-reasoning-preserve,
-    # None = flag omitted, template default applies. Off by default: Qwen-family
-    # models emit very long reasoning traces, and keeping every prior turn's
-    # thinking in the history eats the context window. Turn it on per model.
+    # Preserve earlier reasoning where supported by the template.
+    # None leaves the server default; False explicitly disables preservation.
     "reasoning_preserve": False,
     "repeat_penalty":   1.05,
     # --presence-penalty: flat penalty on any token already present in the
@@ -246,46 +155,34 @@ DEFAULTS = {
     # via --mcp-servers-json and force --jinja (MCP tool calls need the jinja
     # code path). Entries whose files are missing are skipped at launch.
     "mcp_enabled":      [],
-    # Multi-Token Prediction speculative decoding (--spec-type draft-mtp).
-    # Two independent ways this loses instead of wins, both showing up as a
-    # roughly halved token rate, so check which one before blaming the flag:
-    #   FIT      - the server builds a second (draft) context against the
-    #              target model (~1 GB on a 27B). With the main context
-    #              already at the edge of VRAM this pushes weights to the CPU.
-    #              Symptom: near-zero free VRAM, acceptance still fine.
-    #   DRAFTING - low-bit quants quantize the embedded nextn heads too, so
-    #              they draft badly, and on Gated Delta Net layers a rejected
-    #              draft costs a recurrent-state rollback rather than a cheap
-    #              KV drop. Symptom: VRAM headroom is fine, acceptance poor.
-    #              A separate higher-precision drafter GGUF (draft_model) can
-    #              win where the same model's embedded heads lose.
+    # Multi-Token Prediction (--spec-type draft-mtp); requires model support.
     "draft_mtp":        False,
     # Tokens drafted per step (--spec-draft-n-max). None = server default (3).
     # Lower it when acceptance is poor (less wasted work per rejection), raise
     # it when acceptance is very high.
     "draft_n_max":      None,
-    # Path to an external draft/MTP module GGUF, passed as --spec-draft-model.
-    # NOT needed for most MTP models: if the GGUF carries its own nextn/MTP
-    # tensors (e.g. Qwen3.8-27B-MTP, "Native-MTP-Preserved" quants), draft-mtp
-    # runs off those and the server logs "creating MTP draft context against
-    # the target model". Only set this when the MTP heads ship as a SEPARATE
-    # GGUF next to the main quant, like the gemma4-assistant drafter files.
+    # Optional external draft GGUF (--spec-draft-model).
     "draft_model":      None,
+    # KV cache types for the DRAFT context only (--spec-draft-type-k /
+    # --spec-draft-type-v, alias -ctkd/-ctvd). Same allowed values as the main
+    # -ctk/-ctv. None = flag omitted, so the draft context uses llama.cpp's own
+    # f16 default rather than inheriting the main cache_type_*. Only emitted
+    # when draft_mtp is on, since there is no draft context otherwise.
+    "draft_cache_type_k": None,
+    "draft_cache_type_v": None,
     "visual_model":     "none",     # None=auto (same folder), "none"=disabled, or path to mmproj
 }
 
 CONTEXT_OPTIONS  = [4096, 8192, 16384, 32768, 49152, 65536, 72000, 80000, 90000, 131072, 150000, 196608, 200000, 262144]
 THREAD_OPTIONS   = [4, 8, 12, 16, 20, 24, 32]
-CACHE_OPTIONS    = [None, "f16", "q8_0", "q5_0", "q5_1", "q4_0", "q4_1", "iq4_nl"]
+# Conservative cache presets. Kernel support and performance depend on the
+# installed server build and hardware; None leaves the server default.
+CACHE_OPTIONS    = [None, "f16", "q8_0", "q4_0"]
 BATCH_OPTIONS    = [None, 256, 512, 1024, 2048, 4096]
 CACHE_RAM_OPTIONS = [None, 0, 4096, 8192, 16384, 32768, 49152, 65536, 131072]
 KV_UNIFIED_OPTIONS = [True, False]
 PARALLEL_OPTIONS   = [None, 1, 2, 3, 4, 6, 8, 16]
-# Presets for -ot. Free-text editable too, so anything else can be typed in.
-# WARNING: any value other than None turns off llama.cpp's automatic VRAM
-# fitter and makes -ngl -1 literal, which is catastrophically slow on a model
-# bigger than the card. Read the "override_tensor" comment in DEFAULTS before
-# touching this.
+# Tensor placement presets; arbitrary rules can also be entered as text.
 OVERRIDE_TENSOR_OPTIONS = [
     None,
     r"per_layer_token_embd\.weight=CPU",   # Qwen3.8-Flash-Next / qwen4exp
@@ -320,26 +217,7 @@ EDITABLE_FIELDS = {"context", "temp", "top_p", "top_k", "min_p",
 INT_EDITABLE_FIELDS = {"context", "top_k", "cache_ram", "parallel"}
 
 
-# ── Hard-coded per-model fixes ────────────────────────────────────────────────
-# Applied automatically in build_command when the model path contains "match"
-# (case-insensitive). Overrides win over saved and default settings; no user
-# action needed. The settings bar shows FIX:<name> when one is active.
-#
-# deepseek-v4-flash (C:\llm\unsloth\DeepSeek-V4-Flash-GGUF):
-#   - The unsloth GGUF embeds a fixed DSML jinja template that is only honored
-#     on the --jinja code path, so jinja is forced on.
-#   - DeepSeek recommends temp=1.0, top_p=1.0, min_p=0.0 with no top-k and no
-#     repeat penalty; the launcher defaults (0.6 / 0.95 / 20 / 1.05) degrade it.
-#   - The context-checkpointing corruption (gibberish from turn 2, PR #25402) is
-#     fixed in mainline, so this no longer pins the patched build in
-#     patches\deepseekv4flash nor disables checkpoints; the stock server is used.
-#   - Also matches the 0731 release (DeepSeek-V4-Flash-0731-GGUF). Its template
-#     acts on exactly two reasoning_effort values, 'high' and 'max' (Think High /
-#     Think Max); low/medium/no_think are read but produce no prefix. It states
-#     no literal value list, so template_reasoning_info cannot narrow the menu.
-#     Both branches sit inside {%- if thinking -%}, so reasoning_effort only
-#     takes effect when thinking is on (--reasoning on) - the template's own
-#     default is thinking = false.
+# Optional per-model overrides and soft defaults, matched against the path.
 MODEL_FIXES = []
 
 
@@ -364,13 +242,13 @@ def find_model_fix(model: Path):
 # ── Persistence ───────────────────────────────────────────────────────────────
 
 def load_saved_settings() -> dict:
-    if SETTINGS_FILE.exists():
-        try:
-            data = json.loads(SETTINGS_FILE.read_text())
-            return _migrate_settings(data)
-        except Exception:
-            pass
-    return {}
+    try:
+        data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    if not isinstance(data, dict) or any(not isinstance(v, dict) for v in data.values()):
+        raise ValueError(f"Invalid settings structure in {SETTINGS_FILE}")
+    return _migrate_settings(data)
 
 
 def _migrate_settings(data: dict) -> dict:
@@ -408,7 +286,18 @@ def _migrate_settings(data: dict) -> dict:
 
 
 def save_settings(all_saved: dict):
-    SETTINGS_FILE.write_text(json.dumps(all_saved, indent=2))
+    # Replace only after the complete JSON has been written successfully.
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                         dir=SETTINGS_FILE.parent,
+                                         delete=False) as tmp:
+            tmp_path = Path(tmp.name)
+            tmp.write(json.dumps(all_saved, indent=2))
+        os.replace(tmp_path, SETTINGS_FILE)
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def cfg_for_model(model: Path, all_saved: dict) -> dict:
@@ -422,10 +311,11 @@ def cfg_for_model(model: Path, all_saved: dict) -> dict:
 
 
 def persist_cfg(model: Path, cfg: dict, all_saved: dict, is_launch: bool = False):
-    # Only save keys that differ from DEFAULTS; skip host (env-managed)
+    # Compare against this model's defaults so explicit tuning survives reload.
+    baseline = cfg_for_model(model, {})
     skip = {"host"}
     delta = {k: v for k, v in cfg.items()
-             if k not in skip and v != DEFAULTS.get(k)}
+             if k not in skip and v != baseline.get(k)}
     if delta:
         all_saved[str(model)] = delta
     elif str(model) in all_saved:
@@ -483,7 +373,7 @@ def find_models():
             continue
         for f in sorted(p.rglob("*.gguf")):
             name = f.name.lower()
-            if is_mmproj(f):
+            if is_mmproj(f) or is_draft(f):
                 continue
             # Split GGUFs: only the first shard is launchable; llama-server
             # picks up the rest of the -NNNNN-of-NNNNN set automatically.
@@ -517,7 +407,13 @@ def find_all_mmproj():
 # A separate drafter module, not a full MTP model: embedded-MTP quants draft
 # from their own nextn layers and never need to be picked here.
 DRAFT_NAME_RE = re.compile(
-    r"draft|nextn|eagle|medusa|speculat|mtp[-_]?(module|head)", re.IGNORECASE)
+    r"draft|nextn|eagle|medusa|speculat|mtp[-_]?(module|head)|(?:^|[-_.])mtp(?=[-_.]|$)",
+    re.IGNORECASE)
+
+
+def is_draft(path: Path) -> bool:
+    """Recognize separate draft modules, including suffix-named MTP shards."""
+    return path.name.lower().startswith("mtp") or bool(DRAFT_NAME_RE.search(path.name))
 
 
 def find_all_draft():
@@ -534,8 +430,7 @@ def find_all_draft():
             shard = re.search(r"-(\d{5})-of-\d{5}\.gguf$", n)
             if shard and shard.group(1) != "00001":
                 continue
-            # Drafters are also named by prefix alone, e.g. mtp-Qwen3.8-27B-Q4_0.gguf
-            if n.startswith("mtp") or DRAFT_NAME_RE.search(f.name):
+            if is_draft(f):
                 found.append(f)
     return found
 
@@ -592,33 +487,9 @@ def _template_tokens(stem: str) -> set:
 # template does not share a name with the model, which the token scorer below
 # can never work out on its own.
 TEMPLATE_OVERRIDES = [
-    # Laguna S 2.1 (and derivatives like -CRACK) shipped with a template that
-    # stopped reasoning after turn 1. Poolside published a fixed one in
-    # poolside/Laguna-S-2.1-GGUF (chat_template.jinja): enable_thinking now
-    # defaults true, preserve_thinking is honoured, and the generation prompt
-    # ends on an open <think>. That is what Laguna-S-2.1.jinja holds. Pair it
-    # with reasoning_preserve=true so prior turns carry real reasoning_content
-    # instead of an empty <think></think>. Older GGUFs still embed the broken
-    # template, so keep this override until the quants are re-uploaded.
+    # Explicit local template mappings; more specific names come first.
     ("laguna", "Laguna-S-2.1.jinja"),
-    # Qwen3.8-Flash-Next (arch qwen4exp) is NOT the dense Qwen3.8: its template
-    # is vision-aware (image/video pads) and merges leading system messages
-    # itself. It must be matched BEFORE the "qwen3.8" entry below, which would
-    # otherwise swallow it and hand a text-only 27B template to a VL model.
-    # It carries the same 'System message must be at the beginning.' raise, so
-    # Qwen3.8-Flash-Next.jinja is the embedded template with that one raise
-    # replaced by a plain <|im_start|>system turn; everything else is
-    # byte-identical. Its reasoning_effort scale is xhigh (default)/medium/low.
     ("qwen3.8-flash-next", "Qwen3.8-Flash-Next.jinja"),
-    # Qwen3.8's embedded template raises 'System message must be at the
-    # beginning.' for any system message that is not messages[0]. Claude Code
-    # (2.1.232) sends its agent-type/skill listing as a system-role message
-    # AFTER the first user message, and llama.cpp's /v1/messages converter
-    # passes that role straight through, so every Claude Code request 500s.
-    # The web UI never hits it because it only ever sends system first.
-    # Qwen3.8.jinja is the embedded template with that one raise replaced by a
-    # plain <|im_start|>system turn; everything else is byte-identical. Taken
-    # from the 27B GGUF, and the Qwen3.8 sizes share this template.
     ("qwen3.8", "Qwen3.8.jinja"),
 ]
 
@@ -690,7 +561,8 @@ def find_template_for_model(model: Path):
         # Require a real family-name match, not just a shared size/quant token
         # like "8b". The model must contain at least one alphabetic core token
         # (e.g. "gemma", "deepseek", "qwen"); org prefixes were already dropped.
-        alpha_core = {t for t in core if any(c.isalpha() for c in t)}
+        alpha_core = {t for t in core if t[0].isalpha() and len(t) > 2
+                      and not re.fullmatch(r"(?:i?q\d+|f\d+|fp\d+)", t)}
         shared_alpha = {t for t in alpha_core if _normalize(t) in model_norm}
         if not shared_alpha:
             continue
@@ -822,7 +694,7 @@ def build_command(model: Path, cfg: dict) -> list:
     fix_args = []
     fix = find_model_fix(model)
     if fix:
-        cfg = {**cfg, **fix["overrides"]}
+        cfg = {**cfg, **fix.get("overrides", {})}
         # "args" always apply; "fallback_args" only when the patched build is
         # missing and we are falling back to the stock server.
         fix_args = list(fix.get("args", []))
@@ -848,8 +720,7 @@ def build_command(model: Path, cfg: dict) -> list:
     if cfg.get("context") is not None:
         cmd += ["-c", str(cfg["context"])]
     cmd += ["--threads", str(cfg["threads"])]
-    if cfg["flash_attn"]:
-        cmd += ["--flash-attn", "on"]
+    cmd += ["--flash-attn", "on" if cfg["flash_attn"] else "off"]
     cmd += ["--host", cfg["host"], "--port", str(cfg["port"])]
     if cfg.get("cache_type_k"):
         cmd += ["-ctk", cfg["cache_type_k"]]
@@ -857,8 +728,8 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["-ctv", cfg["cache_type_v"]]
     if cfg.get("cache_ram") is not None:
         cmd += ["--cache-ram", str(cfg["cache_ram"])]
-    if cfg.get("kv_unified"):
-        cmd += ["--kv-unified"]
+    if cfg.get("kv_unified") is not None:
+        cmd += ["--kv-unified" if cfg["kv_unified"] else "--no-kv-unified"]
     if cfg.get("verbosity") is not None:
         cmd += ["--verbosity", str(cfg["verbosity"])]
     if cfg.get("batch"):
@@ -878,12 +749,6 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--top-k", str(cfg["top_k"])]
     if cfg.get("min_p") is not None:
         cmd += ["--min-p", str(cfg["min_p"])]
-    # --reasoning on/off sets the server-side thinking default. If reasoning
-    # still does not appear in the built-in WebUI, check the WebUI's custom-JSON
-    # field: an un-nested {"enable_thinking": true} does NOTHING (the template
-    # only reads it nested as {"chat_template_kwargs": {"enable_thinking":
-    # true}}), and the WebUI's default sends enable_thinking:false, which wins
-    # over this flag per-request. Keeping that field EMPTY lets this flag win.
     if cfg.get("thinking") is True:
         cmd += ["--reasoning", "on"]
     elif cfg.get("thinking") is False:
@@ -892,13 +757,7 @@ def build_command(model: Path, cfg: dict) -> list:
         cmd += ["--reasoning-budget", str(cfg["thinking_budget"])]
     if cfg.get("reasoning_format") is not None:
         cmd += ["--reasoning-format", cfg["reasoning_format"]]
-    # Thinking is driven by --reasoning on/off (emitted above). The current
-    # llama.cpp build reads it from the template's thinking flag; the older
-    # --chat-template-kwargs '{"enable_thinking": ...}' path is now deprecated
-    # and warns at startup, so we no longer emit it. Templates that instead
-    # gate thinking on a reasoning_effort kwarg (Hunyuan V3, gpt-oss) ignore
-    # enable_thinking, so --reasoning on alone cannot enable thinking there;
-    # the reasoning_effort setting reaches them via --chat-template-kwargs.
+    # Pass template-specific effort through Jinja kwargs.
     if cfg.get("reasoning_effort") is not None:
         cmd += ["--chat-template-kwargs",
                 json.dumps({"reasoning_effort": cfg["reasoning_effort"]})]
@@ -910,7 +769,7 @@ def build_command(model: Path, cfg: dict) -> list:
     # find the best local .jinja for this model and pass it explicitly. Falls
     # back to the embedded template. TEMPLATE_OVERRIDES entries are explicit
     # per-model rules rather than guesses, so they apply even with auto_template
-    # off: those models are known-broken on their embedded template.
+    # off: these are explicit local mappings.
     matched_template = None
     if cfg.get("auto_template"):
         matched_template = find_template_for_model(model)
@@ -926,6 +785,8 @@ def build_command(model: Path, cfg: dict) -> list:
                  or matched_template is not None)
     if use_jinja:
         cmd += ["--jinja"]
+    else:
+        cmd += ["--no-jinja"]
     if matched_template is not None:
         cmd += ["--chat-template-file", str(matched_template)]
     if mcp_defs:
@@ -943,6 +804,10 @@ def build_command(model: Path, cfg: dict) -> list:
         draft = cfg.get("draft_model")
         if draft and Path(draft).exists():
             cmd += ["--spec-draft-model", str(draft)]
+        if cfg.get("draft_cache_type_k"):
+            cmd += ["-ctkd", cfg["draft_cache_type_k"]]
+        if cfg.get("draft_cache_type_v"):
+            cmd += ["-ctvd", cfg["draft_cache_type_v"]]
     if cfg.get("repeat_penalty") is not None:
         cmd += ["--repeat-penalty", str(cfg["repeat_penalty"])]
     if cfg.get("presence_penalty") is not None:
@@ -955,6 +820,18 @@ def build_command(model: Path, cfg: dict) -> list:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+
+def draw_text(stdscr, y, x, text):
+    """Clip writes to the current terminal, including during a resize."""
+    h, w = stdscr.getmaxyx()
+    if not (0 <= y < h and 0 <= x < w - 1):
+        return
+    try:
+        stdscr.addstr(y, x, text[:w - x - 1])
+    except curses.error:
+        # A resize or a wide glyph can invalidate the measured bounds.
+        pass
+
 
 def short_label(model: Path, base_dirs):
     for b in base_dirs:
@@ -985,7 +862,7 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         "/=search  o=sort  d=del-settings  r=rescan  q=quit"
     )
     stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-    stdscr.addstr(0, 0, header[:w-1].ljust(w-1))
+    draw_text(stdscr, 0, 0, header[:w-1].ljust(w-1))
     stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
     # Settings bar
@@ -1052,6 +929,10 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
             nmax = cfg.get("draft_n_max")
             tag = f"mtp:{Path(dm).name}" if dm else "mtp"
             parts.append(f"{tag}(n={nmax})" if nmax is not None else tag)
+            dctk = cfg.get("draft_cache_type_k")
+            dctv = cfg.get("draft_cache_type_v")
+            if dctk: parts.append(f"ctkd={dctk}")
+            if dctv: parts.append(f"ctvd={dctv}")
         if cfg.get("repeat_penalty") is not None:
             parts.append(f"rep={cfg['repeat_penalty']}")
         if cfg.get("presence_penalty") is not None:
@@ -1064,14 +945,14 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         settings_str = " (no models)"
 
     stdscr.attron(curses.color_pair(3))
-    stdscr.addstr(1, 0, settings_str[:w-1].ljust(w-1))
+    draw_text(stdscr, 1, 0, settings_str[:w-1].ljust(w-1))
     stdscr.attroff(curses.color_pair(3))
 
     # Filter bar
     sort_label = "recent" if sort_mode == "recent" else "name"
     filter_bar = f" Filter: {filter_str}_  [sort:{sort_label}]  {len(models)} models"
     stdscr.attron(curses.color_pair(6))
-    stdscr.addstr(2, 0, filter_bar[:w-1].ljust(w-1))
+    draw_text(stdscr, 2, 0, filter_bar[:w-1].ljust(w-1))
     stdscr.attroff(curses.color_pair(6))
 
     # Model list
@@ -1100,21 +981,21 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
         y = list_start + i
         if idx == sel:
             stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-            stdscr.addstr(y, 0, line[:w-1].ljust(w-1))
+            draw_text(stdscr, y, 0, line[:w-1].ljust(w-1))
             stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
         else:
-            stdscr.addstr(y, 0, line[:w-1])
+            draw_text(stdscr, y, 0, line[:w-1])
 
     # Status / command preview
     if models and sel < len(models):
         preview = " ".join(build_command(models[sel], cfg))
         stdscr.attron(curses.color_pair(4))
-        stdscr.addstr(h-1, 0, (" CMD: " + preview)[:w-1].ljust(w-1))
+        draw_text(stdscr, h-1, 0, (" CMD: " + preview)[:w-1].ljust(w-1))
         stdscr.attroff(curses.color_pair(4))
 
     if status:
         stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
-        stdscr.addstr(h-1, 0, status[:w-1].ljust(w-1))
+        draw_text(stdscr, h-1, 0, status[:w-1].ljust(w-1))
         stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
 
     stdscr.refresh()
@@ -1132,7 +1013,7 @@ def inline_edit(stdscr, label, current_val):
     while True:
         prompt = f" Enter {label} (blank=default, Esc=cancel): {buf}_"
         stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(h - 1, 0, prompt[:w - 1].ljust(w - 1))
+        draw_text(stdscr, h - 1, 0, prompt[:w - 1].ljust(w - 1))
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
         stdscr.refresh()
         ch = stdscr.getch()
@@ -1168,7 +1049,7 @@ def mcp_menu(stdscr, cfg):
         stdscr.clear()
         h, w = stdscr.getmaxyx()
         stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(0, 0,
+        draw_text(stdscr, 0, 0,
             " MCP servers  |  up/down=server  space/enter=toggle  q=back"
             .ljust(w-1))
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
@@ -1185,14 +1066,14 @@ def mcp_menu(stdscr, cfg):
                 line += f"  (missing: {missing})"
             if i == sel:
                 stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-                stdscr.addstr(row, 0, line[:w-1].ljust(w-1))
+                draw_text(stdscr, row, 0, line[:w-1].ljust(w-1))
                 stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
             else:
-                stdscr.addstr(row, 0, line[:w-1])
+                draw_text(stdscr, row, 0, line[:w-1])
             row += 1
             if entry.get("endpoint"):
                 stdscr.attron(curses.color_pair(6))
-                stdscr.addstr(row, 0, f"{'':20}{entry['endpoint']}"[:w-1])
+                draw_text(stdscr, row, 0, f"{'':20}{entry['endpoint']}"[:w-1])
                 stdscr.attroff(curses.color_pair(6))
                 row += 1
 
@@ -1279,16 +1160,16 @@ def copy_settings_menu(stdscr, cfg, target: Path, all_saved: dict):
         stdscr.clear()
         h, w = stdscr.getmaxyx()
         stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(0, 0,
+        draw_text(stdscr, 0, 0,
             " Copy settings from another model  |  up/down=pick  enter=copy  "
             "type=filter  tab=include file paths  Esc=cancel".ljust(w-1))
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
 
         stdscr.attron(curses.color_pair(3))
-        stdscr.addstr(1, 0, f" Onto: {short_label(target, base_dirs)}"[:w-1])
+        draw_text(stdscr, 1, 0, f" Onto: {short_label(target, base_dirs)}"[:w-1])
         stdscr.attroff(curses.color_pair(3))
         stdscr.attron(curses.color_pair(6))
-        stdscr.addstr(2, 0,
+        draw_text(stdscr, 2, 0,
             (f" Filter: {filter_str}_   {len(shown)} models with saved settings"
              f"   [file paths (mmproj/draft): "
              f"{'copied too' if include_paths else 'kept as-is'}]")[:w-1])
@@ -1303,10 +1184,10 @@ def copy_settings_menu(stdscr, cfg, target: Path, all_saved: dict):
             line = f" {short_label(m, base_dirs)}"[:list_w].ljust(list_w)
             if idx == sel:
                 stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-                stdscr.addstr(4 + i, 0, line)
+                draw_text(stdscr, 4 + i, 0, line)
                 stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
             else:
-                stdscr.addstr(4 + i, 0, line)
+                draw_text(stdscr, 4 + i, 0, line)
 
         # Preview: what would change on the target
         if shown:
@@ -1318,15 +1199,15 @@ def copy_settings_menu(stdscr, cfg, target: Path, all_saved: dict):
             pw = max(10, w - px - 1)
             if not changes:
                 stdscr.attron(curses.color_pair(5))
-                stdscr.addstr(4, px, "Identical — nothing would change."[:pw])
+                draw_text(stdscr, 4, px, "Identical — nothing would change."[:pw])
                 stdscr.attroff(curses.color_pair(5))
             else:
                 stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
-                stdscr.addstr(3, px, f"{len(changes)} setting(s) would change:"[:pw])
+                draw_text(stdscr, 3, px, f"{len(changes)} setting(s) would change:"[:pw])
                 stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
                 for i, (k, old, new) in enumerate(changes[:h - 6]):
                     txt = f"  {k:<20} {fmt_value(k, old)}  ->  {fmt_value(k, new)}"
-                    stdscr.addstr(4 + i, px, txt[:pw])
+                    draw_text(stdscr, 4 + i, px, txt[:pw])
 
         stdscr.refresh()
         key = stdscr.getch()
@@ -1435,6 +1316,8 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
         ("draft_mtp",      "Draft MTP (--spec-type)",  [False, True]),
         ("draft_n_max",    "MTP draft tokens (n-max)", DRAFT_N_MAX_OPTIONS),
         ("draft_model",    "Draft GGUF (-md, optional)", draft_options),
+        ("draft_cache_type_k", "Draft cache K (-ctkd)", CACHE_OPTIONS),
+        ("draft_cache_type_v", "Draft cache V (-ctvd)", CACHE_OPTIONS),
         ("visual_model",   "Visual model (mmproj)",    visual_options),
     ]
     tabs = [("Main", main_fields), ("Advanced", advanced_fields)]
@@ -1447,7 +1330,7 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
         stdscr.clear()
         h, w = stdscr.getmaxyx()
         stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
-        stdscr.addstr(0, 0,
+        draw_text(stdscr, 0, 0,
             " Settings  |  up/down=field  left/right or +/-=value  enter=edit[*]  "
             "tab=switch tab  q=back".ljust(w-1))
         stdscr.attroff(curses.color_pair(1) | curses.A_BOLD)
@@ -1458,15 +1341,18 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
             chunk = f" {name} "
             if i == tab:
                 stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-                stdscr.addstr(1, x, chunk[:max(0, w - 1 - x)])
+                draw_text(stdscr, 1, x, chunk[:max(0, w - 1 - x)])
                 stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
             else:
                 stdscr.attron(curses.color_pair(6))
-                stdscr.addstr(1, x, chunk[:max(0, w - 1 - x)])
+                draw_text(stdscr, 1, x, chunk[:max(0, w - 1 - x)])
                 stdscr.attroff(curses.color_pair(6))
             x += len(chunk) + 1
 
-        for i, (key, label, options) in enumerate(fields):
+        visible_rows = max(1, h - 5)
+        offset = max(0, sel - visible_rows + 1)
+        for i in range(offset, min(len(fields), offset + visible_rows)):
+            key, label, options = fields[i]
             val = cfg.get(key)
             if key in ("thinking", "reasoning_preserve"):
                 display = {None: "default", True: "on", False: "off"}.get(val, str(val))
@@ -1489,19 +1375,19 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
             line = f"  {editable_marker} {label:<26} {display}"
             if i == sel:
                 stdscr.attron(curses.color_pair(2) | curses.A_BOLD)
-                stdscr.addstr(3 + i, 0, line[:w-1].ljust(w-1))
+                draw_text(stdscr, 3 + i - offset, 0, line[:w-1].ljust(w-1))
                 stdscr.attroff(curses.color_pair(2) | curses.A_BOLD)
             else:
-                stdscr.addstr(3 + i, 0, line[:w-1])
+                draw_text(stdscr, 3 + i - offset, 0, line[:w-1])
 
         if tpl_hint and 4 + len(fields) < h:
             stdscr.attron(curses.color_pair(6))
-            stdscr.addstr(4 + len(fields), 0, f"  {tpl_hint}"[:w-1])
+            draw_text(stdscr, 4 + len(fields), 0, f"  {tpl_hint}"[:w-1])
             stdscr.attroff(curses.color_pair(6))
 
         if menu_status:
             stdscr.attron(curses.color_pair(5) | curses.A_BOLD)
-            stdscr.addstr(h - 1, 0, f" {menu_status}"[:w-1].ljust(w-1))
+            draw_text(stdscr, h - 1, 0, f" {menu_status}"[:w-1].ljust(w-1))
             stdscr.attroff(curses.color_pair(5) | curses.A_BOLD)
 
         stdscr.refresh()
@@ -1553,7 +1439,7 @@ def settings_menu(stdscr, cfg, model=None, all_saved=None):
                 cfg[fkey] = options[(idx + direction) % len(options)]
             else:
                 if fkey == "port":
-                    cfg[fkey] = max(1024, cfg[fkey] + direction)
+                    cfg[fkey] = min(65535, max(1, cfg[fkey] + direction))
 
 
 # ── Search / filter ───────────────────────────────────────────────────────────
@@ -1580,7 +1466,7 @@ def main(stdscr):
 
     base_dirs = [Path(d) for d in MODEL_DIRS]
 
-    stdscr.addstr(0, 0, "Scanning for models...")
+    draw_text(stdscr, 0, 0, "Scanning for models...")
     stdscr.refresh()
 
     all_models = find_models()
@@ -1588,8 +1474,8 @@ def main(stdscr):
 
     if not all_models:
         stdscr.clear()
-        stdscr.addstr(0, 0, "No GGUF models found in " + ", ".join(MODEL_DIRS))
-        stdscr.addstr(1, 0, "Press any key to exit.")
+        draw_text(stdscr, 0, 0, "No GGUF models found in " + ", ".join(MODEL_DIRS))
+        draw_text(stdscr, 1, 0, "Press any key to exit.")
         stdscr.getch()
         return
 
@@ -1617,6 +1503,12 @@ def main(stdscr):
         # ── Quit ──
         if key in (ord('q'), ord('Q'), 27):
             break
+
+        elif not models and key in (
+                curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE,
+                curses.KEY_NPAGE, ord('s'), ord('S')):
+            status = "No models selected. Change the filter or rescan."
+            continue
 
         # ── Navigation ──
         elif key == curses.KEY_UP:
@@ -1666,7 +1558,7 @@ def main(stdscr):
 
         # ── Rescan ──
         elif key in (ord('r'), ord('R')):
-            stdscr.addstr(0, 0, "Rescanning...")
+            draw_text(stdscr, 0, 0, "Rescanning...")
             stdscr.refresh()
             cur_model  = models[sel] if models else None
             all_models = find_models()

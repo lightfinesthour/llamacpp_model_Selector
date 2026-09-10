@@ -7,3 +7,4 @@ __pycache__/
 *.pyc
 model_settings.json.bak
 mcp/
+tests/test_model_selector.py
