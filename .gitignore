@@ -8,3 +8,5 @@ __pycache__/
 model_settings.json.bak
 mcp/
 tests/test_model_selector.py
+example/
+tests/

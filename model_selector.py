@@ -16,6 +16,7 @@ import time
 import tempfile
 from pathlib import Path
 from dotenv import load_dotenv
+import hf_models
 
 load_dotenv(Path(__file__).parent / ".env")
 
@@ -218,7 +219,14 @@ INT_EDITABLE_FIELDS = {"context", "top_k", "cache_ram", "parallel"}
 
 
 # Optional per-model overrides and soft defaults, matched against the path.
-MODEL_FIXES = []
+MODEL_FIXES = [
+    {
+        "name": "qwen38-flash-next-mtp",
+        "match": "qwen3.8-flash-next-uncensored",
+        # https://github.com/ggml-org/llama.cpp/pull/28243
+        "server": r"C:\tools\llamacpp\patches\qwen38-flash-next-mtp\llama-server.exe",
+    },
+]
 
 
 # Two kinds of per-model value live in MODEL_FIXES:
@@ -377,8 +385,11 @@ def find_models():
                 continue
             # Split GGUFs: only the first shard is launchable; llama-server
             # picks up the rest of the -NNNNN-of-NNNNN set automatically.
-            shard = re.search(r"-(\d{5})-of-\d{5}\.gguf$", name)
+            shard = re.search(r"-(\d{5})-of-(\d{5})\.gguf$", name)
             if shard and shard.group(1) != "00001":
+                continue
+            if shard and not all(f.with_name(f.name[:shard.start()] + f"-{i:05d}-of-{shard[2]}" + f.suffix).is_file()
+                                 for i in range(1, int(shard[2]) + 1)):
                 continue
             models.append(f)
     return models
@@ -858,8 +869,9 @@ def draw_list(stdscr, models, sel, cfg, base_dirs, all_saved, sort_mode,
     # Header
     header = (
         " llama.cpp Model Selector  |  "
+        "h=HF-download  x=delete-model  "
         "arrows=navigate  enter=launch  s=settings  c=copy-settings  "
-        "/=search  o=sort  d=del-settings  r=rescan  q=quit"
+        "/=filter  o=sort  d=reset-settings  r=rescan  q=quit"
     )
     stdscr.attron(curses.color_pair(1) | curses.A_BOLD)
     draw_text(stdscr, 0, 0, header[:w-1].ljust(w-1))
@@ -1453,6 +1465,102 @@ def filter_models(all_models, query: str):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def choice_menu(stdscr, title, labels, footer="Enter=select  Esc=back", selected=0):
+    """Scrollable picker shared by the download and deletion workflows."""
+    if not labels:
+        labels = ["No matching files or results. Press Esc to go back."]
+    selected = min(selected, len(labels) - 1)
+    while True:
+        stdscr.clear()
+        h, w = stdscr.getmaxyx()
+        draw_text(stdscr, 0, 0, title)
+        height = max(1, h - 3)
+        offset = max(0, selected - height + 1)
+        for i, label in enumerate(labels[offset:offset + height], offset):
+            attr = curses.color_pair(2) if i == selected else curses.A_NORMAL
+            stdscr.attron(attr)
+            draw_text(stdscr, i - offset + 1, 0, ("> " if i == selected else "  ") + label)
+            stdscr.attroff(attr)
+        draw_text(stdscr, h - 1, 0, footer)
+        stdscr.refresh()
+        key = stdscr.getch()
+        if key in (27, ord('q')):
+            return None
+        if key in (10, 13, curses.KEY_ENTER):
+            return selected
+        if key in (curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE, curses.KEY_NPAGE):
+            delta = {curses.KEY_UP: -1, curses.KEY_DOWN: 1,
+                     curses.KEY_PPAGE: -height, curses.KEY_NPAGE: height}[key]
+            selected = max(0, min(len(labels) - 1, selected + delta))
+
+
+def remote_file_kind(name, size):
+    path = Path(name)
+    if ("mmproj" in name.lower() or "projector" in name.lower()
+            or (VISION_TOWER_RE.search(path.name) and size is not None
+                and size <= VISION_TOWER_MAX_BYTES)):
+        return "vision"
+    if is_draft(path):
+        return "draft"
+    return "model"
+
+
+def variant_label(v):
+    return (f"{v.quant:12} {hf_models.format_bytes(v.size):>14}  {v.name}"
+            + (f"  [{len(v.files)} shards]" if len(v.files) > 1 else "")
+            + ("  [INCOMPLETE - unavailable]" if not v.complete else ""))
+
+
+def hf_download_menu(stdscr, all_saved):
+    """Open the graphical model search and refresh settings when it closes."""
+    curses.def_prog_mode()
+    curses.endwin()
+    status = "Model browser closed. Library and settings refreshed."
+    try:
+        subprocess.run([sys.executable, str(Path(__file__).with_name("model_browser.py"))], check=True)
+    except KeyboardInterrupt:
+        status = "Model browser stopped. Library and settings refreshed."
+    except subprocess.CalledProcessError as exc:
+        status = f"Model browser exited with code {exc.returncode}. Check its terminal output."
+    finally:
+        curses.reset_prog_mode()
+        stdscr.clear()
+        stdscr.refresh()
+        all_saved.clear()
+        all_saved.update(load_saved_settings())
+    return status
+
+
+def delete_model_menu(stdscr, model, all_saved):
+    files = hf_models.model_files(model)
+    # Companions may be shared by several quants: keep them by default.
+    cfg = cfg_for_model(model, all_saved)
+    extras = []
+    for key in ("visual_model", "draft_model"):
+        value = cfg.get(key)
+        if value and value != "none" and Path(value).is_file():
+            extras.extend(hf_models.model_files(Path(value)))
+    extras = [p for p in dict.fromkeys(extras) if p not in files]
+    if extras:
+        option = choice_menu(stdscr, "Delete model - companions may be shared with other models",
+                             ["Keep companion files (recommended)", "Also delete configured vision / draft files", "Cancel"])
+        if option is None or option == 2:
+            return "Deletion cancelled."
+        if option == 1:
+            files += extras
+    total = sum(p.stat().st_size for p in files)
+    action = choice_menu(stdscr, "Permanently delete " + hf_models.format_bytes(total) + "? Review files below",
+                         ["Cancel", "DELETE listed files"] + [str(p) for p in files])
+    if action != 1:
+        return "Deletion cancelled."
+    hf_models.delete_files(files, MODEL_DIRS)
+    delete_cfg(model, all_saved)
+    if all_saved.get("__meta__", {}).get("__last_model__") == str(model):
+        all_saved["__meta__"].pop("__last_model__", None)
+        save_settings(all_saved)
+    return f"Deleted {len(files)} files ({hf_models.format_bytes(total)})."
+
+
 def main(stdscr):
     curses.curs_set(0)
     curses.start_color()
@@ -1472,13 +1580,6 @@ def main(stdscr):
     all_models = find_models()
     all_saved  = load_saved_settings()
 
-    if not all_models:
-        stdscr.clear()
-        draw_text(stdscr, 0, 0, "No GGUF models found in " + ", ".join(MODEL_DIRS))
-        draw_text(stdscr, 1, 0, "Press any key to exit.")
-        stdscr.getch()
-        return
-
     sort_mode  = "name"
     filter_str = ""
     models     = apply_sort(filter_models(all_models, filter_str), sort_mode, all_saved)
@@ -1491,8 +1592,8 @@ def main(stdscr):
         if last_path in models:
             sel = models.index(last_path)
 
-    cfg        = cfg_for_model(models[sel], all_saved)
-    status     = f"Found {len(all_models)} models.   [V]=vision  *=saved  >=launched"
+    cfg        = cfg_for_model(models[sel], all_saved) if models else dict(DEFAULTS)
+    status     = f"Found {len(all_models)} models. h=Hugging Face download  x=delete  [V]=vision  *=saved  >=launched"
 
     while True:
         draw_list(stdscr, models, sel, cfg, base_dirs, all_saved,
@@ -1503,6 +1604,22 @@ def main(stdscr):
         # ── Quit ──
         if key in (ord('q'), ord('Q'), 27):
             break
+
+        elif key in (ord('h'), ord('H'), ord('x'), ord('X')):
+            try:
+                if key in (ord('h'), ord('H')):
+                    status = hf_download_menu(stdscr, all_saved)
+                    filter_str = ""
+                elif models:
+                    status = delete_model_menu(stdscr, models[sel], all_saved)
+                else:
+                    status = "No model selected to delete."
+            except (OSError, ValueError) as exc:
+                status = f"Model operation failed: {exc}"
+            all_models = find_models()
+            models = apply_sort(filter_models(all_models, filter_str), sort_mode, all_saved)
+            sel = min(sel, max(0, len(models) - 1))
+            cfg = cfg_for_model(models[sel], all_saved) if models else dict(DEFAULTS)
 
         elif not models and key in (
                 curses.KEY_UP, curses.KEY_DOWN, curses.KEY_PPAGE,
