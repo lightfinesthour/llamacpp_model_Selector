@@ -24,6 +24,31 @@ SORTS = {"match": None, "likes": "likes", "downloads": "downloads", "recent": "l
 BYTE_VALUE = r"([\d,.]+)\s*([kKMGTPE]?i?B?|B)"
 
 
+def download_environment():
+    # HF otherwise passes disable=None to tqdm, which hides progress on pipes.
+    # Position -1 forces progress even when stdout/stderr are captured.
+    return {**os.environ, "HF_HUB_DISABLE_PROGRESS_BARS": "0", "TQDM_POSITION": "-1"}
+
+
+def progress_lines(stream):
+    """Read terminal redraws immediately, including tqdm's trailing ANSI moves."""
+    line = []
+    while char := stream.read(1):
+        if char in "\r\n\x1b":
+            if line:
+                yield "".join(line)
+                line.clear()
+            if char == "\x1b" and stream.read(1) == "[":
+                # Consume the CSI cursor/style command, not download-log text.
+                while control := stream.read(1):
+                    if "@" <= control <= "~":
+                        break
+        else:
+            line.append(char)
+    if line:
+        yield "".join(line)
+
+
 def byte_value(number, unit):
     unit = unit.upper()
     power = "KMGTPE".find(unit[0]) + 1 if unit and unit[0] in "KMGTPE" else 0
@@ -269,10 +294,10 @@ class BrowserState:
                     self.process = subprocess.Popen([shutil.which("hf"), "download", body["repo"], name,
                         "--revision", revision, "--local-dir", str(destination)], stdout=subprocess.PIPE,
                         stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace",
-                        env={**os.environ, "HF_HUB_DISABLE_PROGRESS_BARS": "0"},
+                        env=download_environment(),
                         creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                     process = self.process
-                for line in process.stdout:
+                for line in progress_lines(process.stdout):
                     with self.lock:
                         self.transfer.read(line)
                         self.job["log"] = (self.job["log"] + "\n" + line.rstrip())[-16000:]

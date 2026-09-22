@@ -221,6 +221,13 @@ INT_EDITABLE_FIELDS = {"context", "top_k", "cache_ram", "parallel"}
 # Optional per-model overrides and soft defaults, matched against the path.
 MODEL_FIXES = [
     {
+        "name": "ternary-bonsai-2",
+        "match": "ternary-bonsai-2-",
+        # PrismML's PQ2_0/PTQ1_0 kernels and Bonsai 2 activation rotations.
+        # https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10685-7dffb15
+        "server": r"C:\tools\llamacpp\patches\ternary-bonsai-2\llama-server.exe",
+    },
+    {
         "name": "qwen38-flash-next-mtp",
         "match": "qwen3.8-flash-next-uncensored",
         # https://github.com/ggml-org/llama.cpp/pull/28243

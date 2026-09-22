@@ -80,7 +80,16 @@ Auto-match selects a local `.jinja` template by filename heuristics and otherwis
 This build includes [llama.cpp PR #28243](https://github.com/ggml-org/llama.cpp/pull/28243)
 for Qwen3.8 Flash Next MTP. Keep Draft MTP enabled and select the matching
 `MTP-draft.gguf` in Advanced settings to use the separate draft head.
-Other models use the normal server. The patch directory contains build instructions
+Paths containing `ternary-bonsai-2-` (case-insensitive, including DERISKED variants)
+use `C:\tools\llamacpp\patches\ternary-bonsai-2\llama-server.exe`.
+This is the [PrismML fork, prism-b10685-7dffb15](https://github.com/PrismML-Eng/llama.cpp/releases/tag/prism-b10685-7dffb15),
+installed from the Windows x64 CUDA 13.3 binary and matching CUDA runtime archives.
+It provides the PQ2_0/PTQ1_0 kernels and activation rotations required by Bonsai 2.
+Both archive SHA-256 digests were verified against the release metadata; download
+URLs and hashes are recorded in `release.json` in the patch directory.
+Restore this build if it is missing: stock fallback cannot run these custom quants.
+
+Other models use the normal server. The Qwen patch directory contains build instructions
 and the pinned source revision. If the patched executable is missing, the existing
 exception mechanism falls back to the normal server, which may not support this MTP
 head; disable Draft MTP or restore the patched build before launching.
